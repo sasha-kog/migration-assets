@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kognitos.example/schemas/run_capture.schema.json",
+  "title": "run_capture.json",
+  "description": "Per-run capture manifest. One per representative run folder under run_captures/.",
+  "type": "object",
+  "required": ["run_metadata", "input_file", "stages"],
+  "additionalProperties": false,
+  "properties": {
+    "run_metadata": {
+      "type": "object",
+      "required": ["orchestrator_run_id"],
+      "additionalProperties": true,
+      "properties": {
+        "orchestrator_run_id": { "type": "string", "minLength": 1 },
+        "case_number": { "type": ["string", "null"] },
+        "orchestrator_run_timestamp": { "type": ["string", "null"] }
+      }
+    },
+    "input_file": { "type": ["string", "null"] },
+    "stages": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["stage_number", "stage_name", "automation_id", "klang_version_at_run_time", "klang_version_current", "comparability", "trace_captured", "branches_exercised"],
+        "additionalProperties": true,
+        "properties": {
+          "stage_number": { "type": "integer", "minimum": 0 },
+          "stage_name": { "type": "string" },
+          "automation_id": { "type": "string" },
+          "document_token": { "type": ["string", "null"] },
+          "klang_hash": { "type": ["string", "null"] },
+          "klang_version_at_run_time": { "type": "string" },
+          "klang_version_current": { "type": "string" },
+          "comparability": { "type": "string", "enum": ["current", "near-current", "supplementary"] },
+          "comparability_reason": { "type": ["string", "null"] },
+          "trace_captured": { "type": "boolean" },
+          "trace_path": { "type": ["string", "null"] },
+          "branches_exercised": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "ui_captures": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["lineId", "target", "status"],
+              "additionalProperties": true,
+              "properties": {
+                "lineId": { "type": "string" },
+                "target": { "type": "string" },
+                "status": { "type": "string", "enum": ["pending", "captured", "skipped", "failed"] },
+                "path": { "type": ["string", "null"] }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

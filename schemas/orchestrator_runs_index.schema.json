@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kognitos.example/schemas/orchestrator_runs_index.schema.json",
+  "title": "_orchestrator_runs_index.json",
+  "description": "Phase B.1 output. Dump of ListWorkersByProcedure.",
+  "type": "object",
+  "required": ["fetched_at", "filter", "runs"],
+  "additionalProperties": false,
+  "properties": {
+    "fetched_at": { "type": "string", "format": "date-time" },
+    "filter": {
+      "type": "object",
+      "required": ["procedureId", "departmentId"],
+      "additionalProperties": true,
+      "properties": {
+        "procedureId": { "type": "string" },
+        "departmentId": { "type": "string" },
+        "stage": { "type": "string" }
+      }
+    },
+    "runs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id"],
+        "additionalProperties": true,
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "state": { "type": ["string", "null"] },
+          "createdAt": { "type": ["string", "null"] },
+          "stateLastUpdatedAt": { "type": ["string", "null"] },
+          "totalExecutionTimeInSeconds": { "type": ["number", "null"] },
+          "knowledgeId": { "type": ["string", "null"] },
+          "attachments": {
+            "type": ["array", "null"],
+            "items": { "type": "string" }
+          },
+          "triggerInfo": { "type": ["object", "null"] }
+        }
+      }
+    }
+  }
+}

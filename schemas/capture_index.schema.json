@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kognitos.example/schemas/capture_index.schema.json",
+  "title": "_capture_index.json",
+  "description": "Phase D aggregate. The consumer-friendly index Phase 2-3 reads.",
+  "type": "object",
+  "required": ["stages", "captures", "branch_coverage_per_stage"],
+  "additionalProperties": false,
+  "properties": {
+    "stages": {
+      "type": "object",
+      "patternProperties": {
+        "^[0-9]+$": {
+          "type": "object",
+          "required": ["name", "current_version_label"],
+          "additionalProperties": false,
+          "properties": {
+            "name": { "type": "string" },
+            "current_version_label": { "type": "string" }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "captures": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["run_id", "folder", "stages_comparability", "branches_exercised_per_stage"],
+        "additionalProperties": true,
+        "properties": {
+          "run_id": { "type": "string" },
+          "folder": { "type": "string" },
+          "case_number": { "type": ["string", "null"] },
+          "input_file": { "type": ["string", "null"] },
+          "stages_comparability": {
+            "type": "object",
+            "patternProperties": {
+              "^[0-9]+$": { "type": "string", "enum": ["current", "near-current", "supplementary"] }
+            },
+            "additionalProperties": false
+          },
+          "stages_comparability_reasons": {
+            "type": "object",
+            "patternProperties": {
+              "^[0-9]+$": { "type": "string" }
+            },
+            "additionalProperties": false
+          },
+          "branches_exercised_per_stage": {
+            "type": "object",
+            "patternProperties": {
+              "^[0-9]+$": {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    "branch_coverage_per_stage": {
+      "type": "object",
+      "patternProperties": {
+        "^[0-9]+$": {
+          "type": "object",
+          "patternProperties": {
+            "^[A-Za-z0-9_-]+$": {
+              "type": "object",
+              "required": ["current", "near-current", "supplementary"],
+              "additionalProperties": false,
+              "properties": {
+                "current": { "type": "array", "items": { "type": "string" } },
+                "near-current": { "type": "array", "items": { "type": "string" } },
+                "supplementary": { "type": "array", "items": { "type": "string" } }
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

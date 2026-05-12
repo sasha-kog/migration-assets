@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kognitos.example/schemas/branch_triage.schema.json",
+  "title": "_branch_triage.json",
+  "description": "Phase B output. One representative run picked per (stage, branch). Phase C reads this to know which runs to deep-capture.",
+  "type": "object",
+  "required": ["computed_at", "input_runs_count", "stages"],
+  "additionalProperties": false,
+  "properties": {
+    "computed_at": { "type": "string", "format": "date-time" },
+    "input_runs_count": { "type": "integer", "minimum": 0 },
+    "stages": {
+      "type": "object",
+      "patternProperties": {
+        "^[0-9]+$": {
+          "type": "object",
+          "patternProperties": {
+            "^[A-Za-z0-9_-]+$": {
+              "type": "object",
+              "required": ["candidates", "chosen", "reason"],
+              "additionalProperties": false,
+              "properties": {
+                "candidates": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": ["run_id"],
+                    "additionalProperties": true,
+                    "properties": {
+                      "run_id": { "type": "string", "minLength": 1 },
+                      "createdAt": { "type": ["string", "null"] },
+                      "state": { "type": ["string", "null"] },
+                      "knowledgeId": { "type": ["string", "null"] },
+                      "predicate_value_at_decision_line": { "type": ["string", "null"] }
+                    }
+                  }
+                },
+                "chosen": { "type": ["string", "null"] },
+                "reason": { "type": "string" }
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "coverage_gaps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["stage", "branch", "reason"],
+        "additionalProperties": true,
+        "properties": {
+          "stage": { "type": "integer", "minimum": 0 },
+          "branch": { "type": "string" },
+          "reason": { "type": "string" },
+          "severity": { "type": "string", "enum": ["info", "warning", "blocking"] }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kognitos.example/schemas/hydration.schema.json",
+  "title": "_hydration.json",
+  "description": "Phase 0 output manifest. Produced by Phase 0.9.",
+  "type": "object",
+  "required": ["hydrated_at", "input", "derived", "stages", "assets"],
+  "additionalProperties": false,
+  "properties": {
+    "hydrated_at": { "type": "string", "format": "date-time" },
+    "input": {
+      "type": "object",
+      "required": ["process_published_url"],
+      "additionalProperties": false,
+      "properties": {
+        "process_published_url": { "type": "string", "format": "uri" }
+      }
+    },
+    "derived": {
+      "type": "object",
+      "required": ["department_id", "procedure_id", "automation_name", "automation_slug", "output_base_dir"],
+      "additionalProperties": true,
+      "properties": {
+        "department_id": { "type": "string", "minLength": 1 },
+        "procedure_id": { "type": "string", "minLength": 1 },
+        "automation_name": { "type": "string", "minLength": 1 },
+        "automation_slug": { "type": "string", "pattern": "^[a-z0-9_]+$" },
+        "output_base_dir": { "type": "string" },
+        "jwt_source": {
+          "type": ["string", "null"],
+          "enum": ["playwright_profile", "env", "paste", "none-yet", null]
+        },
+        "jwt_fetched_at": { "type": ["string", "null"], "format": "date-time" }
+      }
+    },
+    "department_catalog": {
+      "type": "object",
+      "required": ["source", "fetched_at", "procedures"],
+      "additionalProperties": false,
+      "properties": {
+        "source": { "type": "string" },
+        "fetched_at": { "type": "string", "format": "date-time" },
+        "procedures": {
+          "type": "object",
+          "patternProperties": {
+            "^[a-z0-9]+$": {
+              "type": "object",
+              "required": ["name"],
+              "properties": {
+                "name": { "type": "string" },
+                "latest_run_id": { "type": ["string", "null"] }
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    "stages": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["stage_number", "procedure_id", "name", "klang_path", "klang_source", "child_procedure_ids_static", "discovered_via"],
+        "additionalProperties": false,
+        "properties": {
+          "stage_number": { "type": "integer", "minimum": 0 },
+          "procedure_id": { "type": "string", "minLength": 1 },
+          "name": { "type": "string", "minLength": 1 },
+          "klang_path": { "type": "string" },
+          "klang_source": { "type": "string", "enum": ["copy_capture", "api_render", "user_paste", "cached"] },
+          "klang_source_run_id": { "type": ["string", "null"] },
+          "klang_hash": { "type": ["string", "null"] },
+          "procedure_version_at_fetch": { "type": ["string", "null"] },
+          "child_procedure_ids_static": { "type": "array", "items": { "type": "string" } },
+          "discovered_via": { "type": "string", "enum": ["url", "klang_static_parse_from_stage_0", "klang_static_parse"] }
+        }
+      }
+    },
+    "runtime_only_blocks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind", "parent_stage", "parent_line_text", "phase_c_action"],
+        "additionalProperties": true,
+        "properties": {
+          "kind": { "type": "string", "enum": ["miniPlayground", "loop_body"] },
+          "parent_stage": { "type": "integer", "minimum": 0 },
+          "parent_line_text": { "type": "string" },
+          "parent_lineId": { "type": ["string", "null"] },
+          "phase_c_action": { "type": "string" }
+        }
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "assets": {
+      "type": "object",
+      "required": ["run_capture_template_path", "filled_capture_example_path"],
+      "additionalProperties": false,
+      "properties": {
+        "run_capture_template_path": { "type": "string" },
+        "filled_capture_example_path": { "type": "string" }
+      }
+    }
+  }
+}

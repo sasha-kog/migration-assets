@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kognitos.example/schemas/stage_branch_trace.schema.json",
+  "title": "stage<N>_branch_trace.json",
+  "description": "Per-stage execution trace. Lines + iteration structure for one stage of one run.",
+  "type": "object",
+  "required": ["stage_number", "stage_name", "automation_id", "document_token", "lines"],
+  "additionalProperties": true,
+  "properties": {
+    "stage_number": { "type": "integer", "minimum": 0 },
+    "stage_name": { "type": "string" },
+    "automation_id": { "type": "string" },
+    "document_token": { "type": "string" },
+    "klang_hash": { "type": ["string", "null"] },
+    "klang_version_at_run_time": { "type": ["string", "null"] },
+    "klang_version_current": { "type": ["string", "null"] },
+    "lines": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/lineRecord" }
+    },
+    "iterations": {
+      "type": "object",
+      "patternProperties": {
+        "^v2_[a-f0-9_]+$": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["iteration_token", "lines"],
+            "additionalProperties": false,
+            "properties": {
+              "iteration_token": { "type": "string" },
+              "lines": {
+                "type": "array",
+                "items": { "$ref": "#/$defs/lineRecord" }
+              }
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "$defs": {
+    "lineRecord": {
+      "type": "object",
+      "required": ["lineId", "text", "status"],
+      "additionalProperties": true,
+      "properties": {
+        "lineId": { "type": "string" },
+        "token": { "type": ["string", "null"] },
+        "parent_lineId": { "type": ["string", "null"] },
+        "text": { "type": "string" },
+        "status": { "type": "string" },
+        "started_at": { "type": ["string", "null"] },
+        "completed_at": { "type": ["string", "null"] },
+        "produced": { "type": ["object", "null"] },
+        "referenced": { "type": "array" },
+        "recursion": { "type": ["object", "null"] },
+        "requires_ui_capture": { "type": "boolean" },
+        "ui_capture_target": { "type": ["string", "null"] },
+        "ui_capture_status": { "type": ["string", "null"], "enum": [null, "pending", "captured", "skipped", "failed"] },
+        "ui_capture_path": { "type": ["string", "null"] },
+        "ui_capture_timestamp": { "type": ["string", "null"] },
+        "ui_capture_notes": { "type": ["string", "null"] },
+        "synthetic": { "type": "boolean" }
+      }
+    }
+  }
+}

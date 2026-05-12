@@ -120,6 +120,25 @@ Capture `document.title` — format is `"<automation name> | <department name> |
 
 #### Step 0.4 — Copy-capture the orchestrator KLang (PINNED procedure)
 
+**Idempotency precheck (run BEFORE every stage's capture, including children in Step 0.5):**
+
+Before navigating to the editor for a stage, check whether the output already exists from a prior partial run:
+
+1. Compute the target path: `<OUTPUT_BASE_DIR>/klang/stage<N>_<slug>.txt` (where `<N>` = stage number, `<slug>` = slugified procedure name).
+2. If the file exists, read it and run the **same sanity check** the spec applies after a fresh capture (see "Sanity checks before saving" further down):
+   - length > 100 chars,
+   - contains `the ` or `if ` (KLang language signals),
+   - no abrupt mid-token truncation.
+3. If the sanity check passes:
+   - **SKIP** the navigate + copy-capture work for this stage.
+   - Use the existing file as input to downstream steps (child discovery in Step 0.5, runtime-block scan in Step 0.6).
+   - When Step 0.9 builds `_hydration.json`, mark this stage as `"klang_source": "cached"` and copy `klang_path` from the existing file location.
+4. If the file is missing OR the sanity check fails:
+   - Proceed with the full capture procedure below.
+   - On a subsequent rerun this stage will then be cached.
+
+The same idempotency rule applies to the API fallback (Step 0.7) and user-paste fallback (Step 0.8): if a valid file already exists, those tiers don't re-run for that stage either. `_hydration.json` is always regenerated from current on-disk state — don't attempt to merge an old `_hydration.json` with new work.
+
 **The listener install, selection, copy, AND read MUST run in ONE synchronous `browser_evaluate` call.** Splitting across calls is unreliable (verified empirically — same code works in one call, returns empty when split across two). Pass the full block:
 
 ```js
@@ -483,6 +502,35 @@ Selection heuristics for `chosen`:
 `coverage_gaps` are flagged in `branch_catalog.md` for the user. Phase C does NOT block on gaps — the user decides whether to expand the sample window or formally accept the gap.
 
 ### Phase C — Per-run deep capture
+
+#### Phase C.0 — Preflight smoke test (run ONCE, before any deep captures)
+
+Phase C is the slowest phase (1-5 min per representative run × ~10 runs). Failing fast on a broken environment saves 30+ minutes of partial captures. Run these three checks in sequence; abort with a specific error if any fails.
+
+1. **JWT auth check.** Call `ListWorkersByProcedure(procedureId=<PROCEDURE_ID>, departmentId=<DEPARTMENT_ID>, stage="PUBLISHED", limit=1)`. Expect HTTP 200 with `items[0]` present. Failure modes to surface specifically:
+   - 401 → "JWT rejected. Refresh and retry."
+   - 0 items → "No runs found for this procedure. Did you point at the right URL?"
+   - Network error → "Cannot reach api.app.kognitos.com. Check network / VPN."
+2. **Exec-data fetch check.** Take `items[0].id` from step 1 (`<probe_run_id>`). Call `getSentenceExecutionData(workerId=<probe_run_id>, documentToken="", token=null)`. Expect a non-empty array. Failure modes:
+   - Empty response → "Exec data unavailable for `<probe_run_id>`. Try the next-most-recent run."
+   - Schema error → "Exec data shape unexpected — Kognitos may have changed the API. Surface to maintainer."
+3. **S3 download check.** Navigate Playwright to the probe run's editor page (`<PROCESS_PUBLISHED_URL>/run/<probe_run_id>`). Find the input file element on the orchestrator's "the attachments are …" line. Click it. Capture the next signed S3 URL via `browser_network_requests`. `curl` it. Expect HTTP 200 with non-zero bytes. Failure modes:
+   - No file element found → "Orchestrator's input file not visible in editor. Confirm the automation is file-driven, or surface as a known gap."
+   - Signed URL expired immediately → "S3 URL expired before download. Probably a clock-skew or rate-limit issue."
+   - 403/404 → "S3 access denied. JWT may need scope expansion."
+
+Total wall-clock: ~30 seconds. If all three pass, proceed to per-run captures. The artifact downloaded in step 3 is throwaway — don't keep it.
+
+**Per-run idempotency precheck:** Before doing any work for a representative run, check whether its folder already exists from a prior partial run:
+
+1. Folder path: `<OUTPUT_BASE_DIR>/run_captures/<YYYY-MM-DD_HH-mm>_<run_id>/`.
+2. If the folder exists AND contains a `run_capture.json` that passes schema validation (see "Schema validation" near the end of this spec) AND every `stage<N>_branch_trace.json` referenced in `run_capture.json` is present and validates AND `attachment.<ext>` is present (or explicitly marked absent in the JSON):
+   - **SKIP** this run entirely. Move to the next representative.
+3. If the folder exists but is partial (some traces missing, no `attachment.<ext>`, etc.):
+   - Resume from the first incomplete step rather than restarting. Per-stage trace files that already exist and validate are kept; only missing or invalid ones get refetched.
+4. If the folder doesn't exist: proceed with the full capture (steps 1-9 below).
+
+The agent surfaces a one-line status per run: `cached` (skipped), `resumed` (partial → completed), or `fresh` (newly captured). `_capture_index.json` is always regenerated from on-disk state at the end of Phase D.
 
 For each representative run in `_branch_triage.json`, in this order:
 
@@ -1035,6 +1083,40 @@ And at the run_captures root:
 ├── _capture_index.json                               ← Phase D
 └── _klang_version_evolution.md                       ← only if KLang versions diverge
 ```
+
+---
+
+## Schema validation (run at the end of every phase)
+
+Every JSON file the spec produces has a JSON Schema in `~/kognitos-migration-assets/schemas/`. After each phase completes its work, the agent runs the validator and refuses to declare the phase "done" if any file fails:
+
+```bash
+python3 ~/kognitos-migration-assets/tools/validate.py <OUTPUT_BASE_DIR> --phase <0|B|C|D>
+```
+
+Exit code 0 = all valid; non-zero = at least one file failed. The validator prints one line per file with `OK` or `FAIL <path>: <reason>` so the agent can fix the offending output before moving on.
+
+Files validated by phase:
+
+| Phase | Files |
+|---|---|
+| 0 | `_hydration.json` |
+| B | `_orchestrator_runs_index.json`, `_branch_triage.json` |
+| C | each `run_captures/<folder>/run_capture.json` and every `stage<N>_branch_trace.json` referenced from it |
+| D | `_capture_index.json` |
+
+If a schema is missing for a file the agent generates, that's a spec bug — surface it; don't silently skip. (The validator prints `no-schema (skipped)` for unknown filenames; consider that a soft warning, not a pass.)
+
+The schemas themselves live in `~/kognitos-migration-assets/schemas/`:
+
+- `hydration.schema.json`
+- `orchestrator_runs_index.schema.json`
+- `branch_triage.schema.json`
+- `run_capture.schema.json`
+- `capture_index.schema.json`
+- `stage_branch_trace.schema.json`
+
+When adding new fields to the JSON output, update the corresponding schema in the same commit.
 
 ---
 
