@@ -245,28 +245,246 @@ Produce per stage (each stage gets its own SPy candidate):
 
 - `<OUTPUT_BASE_DIR>/spy_iterations/stage<N>/spy_candidate_v1.txt`
 - `<OUTPUT_BASE_DIR>/spy_iterations/stage<N>/spy_candidate_v2.txt` (if needed)
+- `<OUTPUT_BASE_DIR>/spy_iterations/stage<N>/plan_v<N>.md` — one per Quill plan (D)
+- `<OUTPUT_BASE_DIR>/spy_iterations/stage<N>/iteration_<N>_diff.json` — diff per iteration (A; inline-computed today, via `tools/replay_diff.py` once available)
 - `<OUTPUT_BASE_DIR>/iteration_results.md` — one section per stage
 - `<OUTPUT_BASE_DIR>/handoff_payload_checks.md`
 
+### Two patterns this phase uses on every Quill interaction
+
+Both patterns scope and bound what Quill does. Apply them at initial authoring AND at every fix iteration — not just when things go wrong.
+
+#### Pattern 1 — Plan-first Quill (always two-turn)
+
+Never ask Quill to write SPy in one shot. Always:
+
+- **Turn 1 — request a plan, not code.** Send the SOP context (and, for fixes, the current SPy + fix-context). Quill returns an **implementation plan as plain text**: inputs/bindings, per-branch decision logic with verbatim KLang predicates, sub-process invocations + payload shapes, downstream handoff. Save to `spy_iterations/stage<N>/plan_v<N>.md`.
+- **Turn 1.5 — orchestrator validates the plan.** Checks:
+  - Does it cover every branch in `sop_branch_matrix.md` (or every divergence in the fix-context)?
+  - Are predicates verbatim from KLang text?
+  - Does the handoff payload match the captured contract?
+  - Are decisions scoped (no over-broad changes that touch unrelated branches)?
+  - If gaps: send back specific objections, request a plan revision. Loop here until the plan is sound.
+- **Turn 2 — only after the plan passes, ask Quill to implement.** Prompt: "Plan approved. Implement this plan exactly. No new design decisions." Save SPy to `spy_iterations/stage<N>/spy_candidate_v<N>.txt`.
+
+Why two turns: a bad plan is cheap to fix in text; a bad SPy candidate costs a full run-and-diff to find. Catching mis-direction at the plan stage compounds across iterations.
+
+#### Pattern 2 — Fix-context comes from one of two sources (never invented)
+
+When the orchestrator constructs a fix prompt, the fix-context attached to it must come from real run evidence:
+
+- **Done with divergence (silent failure):** the structured diff between the V1 captured trace and the V2 run's exec data (see "Diff path" below).
+- **Exception (loud failure):** the exception's resolution thread + line + guide via Nexus (see "Exception path" below).
+
+If neither applies (the run passed parity), the iteration is complete; do not prompt Quill again.
+
+### Initial SPy authoring per stage (uses Pattern 1)
+
+Before any iteration:
+
+1. Assemble the planning prompt for stage `<N>`:
+   - SOP section for this stage (`sop_draft.md` → stage `<N>` block)
+   - Branch matrix subset for this stage (`sop_branch_matrix.md` filtered)
+   - Inputs the SPy will receive at runtime (orchestrator metadata + sub-stage handoff signature)
+   - Downstream contract (what `<DOWNSTREAM_BOUNDARY_NAME>` expects)
+2. Send to Quill with the **plan-first prompt** (Pattern 1, Turn 1).
+3. Validate the plan (Pattern 1, Turn 1.5). Save approved plan as `plan_v1.md`.
+4. Send the implement prompt (Pattern 1, Turn 2). Save SPy as `spy_candidate_v1.txt`.
+
+Now enter the iteration loop.
+
 ### Iteration loop per (stage, branch)
 
-1. **Select reference run** via the algorithm above (`current` preferred, `near-current` tolerated). If none: this branch is in the accepted-risk register; skip parity test, write a synthesized minimal-input test fixture instead.
-2. **Replay the input.** Use the reference run's `attachment.<ext>` as the SPy invocation input — do not synthesize new inputs unless the branch is accepted-risk.
-3. **Execute the SPy candidate** in the test environment.
-4. **Collect run evidence** for this stage's execution: branch trace, handoff payload.
-5. **Diff against the reference:**
-   - Branch trace diff: line-by-line vs `stage<N>_branch_trace.json`. For `near-current` references, allow the divergences listed in `stages_comparability_reasons[stage]`.
-   - Handoff payload diff: vs the reference run's recorded payload values (case_number, status, escalation, usecase, usecaseNumber, etc.).
-6. **Apply minimal fix** — change one thing per iteration so failures point at root cause.
-7. **Re-run.**
+1. **Select reference run** via the algorithm in "Schema: per-(captured-run, stage) record" (`current` preferred, `near-current` tolerated). If none: this branch is in the accepted-risk register; skip parity test, write a synthesized minimal-input test fixture instead.
+2. **Invoke the V2 SPy candidate.** `kognitos_invoke_automation(automation=<v2_draft>, input=<reference_run.attachment>)`. Capture the resulting `run_id`.
+3. **Poll status.** `kognitos_runs(get, run_id)` until status transitions to a terminal state (`done`, `failed`, `waiting_for_user_input`, `user stopped`).
+4. **Branch on outcome:**
+   - status == `done` → **Diff path** (below). The SPy completed; check whether it matches the reference.
+   - status in {`failed`, `waiting_for_user_input`} with an exception → **Exception path** (below).
+   - status == `user stopped` → not a SPy failure; surface and re-run.
+5. **If diff is empty AND no exception:** this (stage, branch) PASSES parity. Record in `iteration_results.md`, move on to the next branch.
+6. **Otherwise:** assemble fix-context. Diff JSON from the diff path, OR exception bundle from the exception path. Construct the fix prompt (template below) and send to Quill with Pattern 1 (plan first, validate, then implement). Save the new plan as `plan_v<N+1>.md` and the new SPy as `spy_candidate_v<N+1>.txt`.
+7. **Re-run** (back to step 2). One change per iteration: don't bundle multiple fixes into one Quill turn — the diff at the next iteration should localize each fix's effect.
+
+### Diff path — run status `done`
+
+Goal: produce a structured diff comparing V2's execution to V1's captured trace.
+
+**Asymmetry to internalize:**
+
+- V1 runs live on the legacy `app.kognitos.com` tenant. Nexus does NOT reach that tenant. V1 data is what Phase 1 captured via GraphQL `getSentenceExecutionData` and saved to `stage<N>_branch_trace.json`.
+- V2 runs live on the dev cluster. Nexus DOES reach the dev cluster. V2 data must be fetched via Nexus — there is no GraphQL fallback for V2.
+- V1 and V2 lineIds DO NOT MATCH. V2 SPy is a rewritten automation; its KLang hashes are new. **Do NOT try to align V1 and V2 by lineId.** Align by **predicate text + binding name + structural position** (which branch in the SOP each predicate belongs to).
+
+Inputs:
+- V1 reference: `run_captures/<folder>/stage<N>_branch_trace.json` + recorded handoff payload values in `run_capture.json`.
+- V2 actual: the just-finished run's `run_id` (on dev cluster).
+
+Procedure:
+
+1. **Fetch V2's execution data via Nexus.** The relevant calls:
+   - `kognitos_runs(get, run_id=<v2_run_id>)` — run metadata + final status.
+   - `kognitos_runs(list_events, run_id=<v2_run_id>)` — event-by-event execution log. This is the source-of-truth for what V2 did, the analog of V1's `getSentenceExecutionData`.
+   - `kognitos_runs(get_run_outputs, run_id=<v2_run_id>)` — final output bindings, including the handoff payload at the boundary.
+2. **Normalize V1 and V2 onto a shared comparison schema.** Because lineIds don't match, the comparison key is (predicate text OR binding name OR SOP branch label), not lineId. Recommended in-memory shape for each side:
+
+   ```json
+   {
+     "branch_decisions": [
+       { "sop_branch": "B1a", "predicate_text": "if the file's extension is 'csv' then", "status": "Met" | "Not Met" }
+     ],
+     "named_bindings": [
+       { "name": "customer", "value": "Woolworths" },
+       { "name": "paymentAmt", "value": "1500.00" }
+     ],
+     "child_invocations": [
+       { "name": "Update the Case", "payload": { "caseNumber": "...", "status": "close", ... } }
+     ]
+   }
+   ```
+
+   V1 is shaped this way by walking `stage<N>_branch_trace.json` and pulling the `if`/`else if` predicates + `produced` bindings + `subDocuments` invocations.
+
+   V2 is shaped this way by walking the Nexus event list and applying the same extraction. Predicate text is the join key for branch decisions; binding name is the join key for produced values.
+
+3. **Compute diff.** For each entry in V1 that has a counterpart in V2 (matched by predicate text or binding name):
+   - **Predicate mismatch**: V1 says `Met`, V2 says `Not Met` (or vice versa).
+   - **Value mismatch**: V1 binds `customer = "Woolworths"`, V2 binds `customer = "Woolworths Ltd"`.
+   - **Extra V2 entries** (V2 took a branch V1 didn't): record as "extra path."
+   - **Missing V2 entries** (V1 took a branch V2 didn't): record as "missing path."
+   - For `near-current` references: drop divergences listed in `stages_comparability_reasons[stage]` from the diff before declaring non-empty.
+
+4. **Compute handoff payload diff.** V2's final payload at the boundary (from `kognitos_runs(get_run_outputs)` or the relevant child-invocation payload in step 2 above) vs V1's recorded payload values.
+
+5. **Write `spy_iterations/stage<N>/iteration_<N>_diff.json`** with this shape:
+
+   ```json
+   {
+     "iteration": "<N>",
+     "stage": "<N>",
+     "branch": "<id>",
+     "v1_reference_run": "<run_id>",
+     "v2_run_id": "<run_id>",
+     "trace_diff": {
+       "predicate_mismatches": [
+         { "sop_branch": "B1a", "predicate_text": "if … then",
+           "v1_status": "Met", "v2_status": "Not Met" }
+       ],
+       "value_mismatches": [
+         { "binding": "customer",
+           "v1_value": "Woolworths", "v2_value": "Woolworths Ltd" }
+       ],
+       "extra_v2_branches": [ /* sop_branch labels */ ],
+       "missing_v2_branches": [ /* sop_branch labels */ ]
+     },
+     "payload_diff": {
+       "<field>": { "v1": "...", "v2": "..." }
+     },
+     "tolerated_divergences_dropped": [ /* near-current notes that were filtered out */ ]
+   }
+   ```
+
+   If both `trace_diff` (after tolerance filtering) and `payload_diff` are empty: parity. Iteration is done for this branch.
+
+6. **Today** the agent computes the diff inline (Python via a Bash tool call: load V1 JSON from disk, call Nexus `kognitos_runs(list_events)` to get V2 events, normalize both sides, compare). **Once `~/kognitos-migration-assets/tools/replay_diff.py` exists**, replace inline diff with one tool invocation — same output schema. The spec doesn't require the tool yet; it requires the diff JSON to have the shape above.
+
+### Exception path — run status `failed` or `waiting_for_user_input`
+
+When a V2 run errors out or pauses on an exception, the Kognitos platform's resolution agent reasons about it and stores that reasoning in the exception thread. Hijack it as fix-context.
+
+Procedure:
+
+1. `kognitos_runs(list_events, run_id=<v2_run_id>)` → walk events to find the exception event; grab `exception_id`.
+2. `kognitos_inspect_exceptions(get, exception_id)` → exception text + the line that triggered it.
+3. `kognitos_inspect_exceptions(list_events, exception_id)` → the **resolution thread**: every message the resolution agent and any prior reviewers exchanged. This is the Kognitos-native chain-of-thought trace.
+4. `kognitos_inspect_exceptions(get_guide, exception_id)` → troubleshooting guide for this exception type (if one exists; may return empty).
+5. Write the bundle to `spy_iterations/stage<N>/iteration_<N>_exception.json`:
+
+   ```json
+   {
+     "iteration": "<N>",
+     "stage": "<N>",
+     "branch": "<id>",
+     "v2_run_id": "<run_id>",
+     "exception": {
+       "id": "<exception_id>",
+       "text": "...",
+       "line": "...",
+       "lineId": "v2_…"
+     },
+     "resolution_thread": [
+       { "author": "resolution_agent", "text": "..." }
+     ],
+     "guide": "<get_guide output or null>"
+   }
+   ```
+
+Do NOT auto-reply to the exception via `kognitos_reply_to_exception` from the iteration loop — that's interacting with Kognitos's own resolution agent, which can produce side effects (advancing the run, triggering further exceptions). The exception is read-only fix-context for Quill.
+
+### Fix prompt template (used in iteration step 6)
+
+Construct as a single Quill message with these sections, in order:
+
+```
+Goal: fix divergence in stage <N>, branch <id>, between V2 SPy candidate v<N> and V1 reference run.
+
+Current SPy candidate (v<N>):
+  <contents of spy_candidate_v<N>.txt>
+
+V1 reference (captured production behavior):
+  <link or excerpt from run_captures/.../stage<N>_branch_trace.json relevant to this branch>
+
+What went wrong (PICK ONE):
+
+[If diff path]
+  Diff between V2 and V1 (iteration_<N>_diff.json):
+    Predicate mismatches: ...
+    Value mismatches: ...
+    Extra V2 lines: ...
+    Missing V2 lines: ...
+    Payload diff: ...
+
+[If exception path]
+  V2 hit an exception at line <line>:
+    Exception text: <text>
+  How the Kognitos resolution agent reasoned about it:
+    <resolution_thread formatted as turns>
+  Troubleshooting guide (if any):
+    <guide>
+
+Constraints:
+- Make the MINIMAL change to address the divergence above.
+- Do NOT touch other branches.
+- Preserve verbatim KLang predicates and binding names.
+- If the fix changes the handoff payload shape, flag it explicitly.
+
+DO NOT write the SPy yet. Draft an implementation plan first, as plain text.
+```
+
+After Quill returns the plan, validate (Pattern 1, Turn 1.5). On approval, the second-turn implement prompt is:
+
+```
+Plan approved. Implement this plan exactly in spy_candidate_v<N+1>.txt.
+No new design decisions. If you discover the plan is incomplete, stop and ask.
+```
 
 ### Validation Rules
 
 - Real execution evidence is required; static trace-only analysis is not enough.
-- Per-stage parity is required: a (stage, branch) is "passing" only when its branch trace matches the reference (within tolerated divergences) AND the handoff payload matches.
+- Per-stage parity is required: a (stage, branch) is "passing" only when its trace diff (after tolerance filtering) AND payload diff are both empty.
 - Explicitly validate handoff payload keys at the pipeline boundary: `<HANDOFF_FIELDS>`.
 - Treat `<DOWNSTREAM_BOUNDARY_NAME>` as boundary unless explicitly in scope.
 - For `accepted-risk` branches, the synthesized test fixture must drive the branch and the SPy must produce a self-consistent end-state — but no production-trace diff is possible.
+- Every Quill interaction in this phase uses Pattern 1 (plan first, then implement). No exceptions.
+- Fix-context attached to a Quill fix prompt comes from real run evidence — the diff JSON or the exception bundle. Never from the orchestrator's hypothesis about what *might* have gone wrong.
+
+### Capping iterations
+
+If a (stage, branch) hits **3 iterations without convergence** (diff still non-empty or exception still firing), stop the loop, write the latest diff/exception bundle to `iteration_results.md` with `status: blocked`, and surface to the user. Likely causes worth checking before continuing:
+
+- The reference run is `near-current` with an undocumented divergence (revisit `stages_comparability_reasons`).
+- The branch was never actually parity-eligible (downgrade to `accepted-risk` with sign-off).
+- Quill is stuck in a local minimum (rotate the fix prompt — try framing the divergence differently).
 
 ## Safety Rules
 
