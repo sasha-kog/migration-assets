@@ -184,18 +184,31 @@ For each child ID:
 
 Stop when the set of discovered procedure IDs stabilizes (no new IDs on the latest pass).
 
-#### Step 0.6 — Flag deferred-to-Phase-C stages
+#### Step 0.6 — Forward-signal runtime-only blocks to Phase C
 
-These appear only in runtime exec data, not in static KLang:
+Phase 0 has fully captured the KLang for **everything that has KLang text**. But two kinds of constructs have *additional runtime artifacts* that Phase C will need to fetch separately. Scan the captured KLang and forward-signal these to `_hydration.json` so Phase C knows to expect them. **No KLang fetching needed in Phase 0 for these** — their textual definition is already captured.
 
-- **`miniPlaygrounds`** — embedded extraction prompts (`extract data from the document` blocks). Their `documentToken` is only known at runtime.
-- **Loop bodies** — `process each <item> as follows` blocks. Iterations only manifest in exec data.
+- **`miniPlaygrounds`** — `extract data from the document` and `extract a table from the document where` blocks. The parameters (`the first field is ...`, `the first field's rule is ...`) are already captured as child lines under the parent in the copy-capture output. What's missing is the worker's *runtime-generated document* (the actual prompt sent to Gemini + extraction results), which is addressable only by a `documentToken` that doesn't exist until a run executes. Phase C fetches that exec data; Phase 0 just notes the parent line.
+- **Loop bodies** — `process each <item> as follows` blocks. The body's KLang lines are already in the orchestrator's editor copy. What's missing is the per-iteration exec data (5 iterations = 5 separate API calls scoped by `iterationToken`). Phase C fetches per iteration; Phase 0 just notes the loop's parent line.
 
-For each match in the captured KLang, add an entry to `_hydration.json` under `deferred_to_phase_c` with parent stage, parent line text, and reason. Phase C captures these.
+Loop bodies are NOT separate stages (they reuse the parent stage's lineIds). MiniPlaygrounds become separate stages only at Phase C's trace-record level, not at the KLang-text level.
 
-#### Step 0.7 — API fallback (only if copy-capture fails)
+Write one entry per match into `_hydration.json` under `runtime_only_blocks`:
 
-If sanity check fails at Step 0.4 for any stage:
+```json
+"runtime_only_blocks": [
+  { "kind": "miniPlayground", "parent_stage": 0,
+    "parent_line_text": "extract data from the document",
+    "phase_c_action": "fetch documentToken from getSentenceExecutionData; treat as new stage in trace records" },
+  { "kind": "loop_body", "parent_stage": 0,
+    "parent_line_text": "process each row as follows",
+    "phase_c_action": "fetch per-iteration exec data via iterationToken; append to stage trace under iterations[<parent_lineId>]" }
+]
+```
+
+#### Step 0.7 — API fallback (Tier 2, when Playwright copy-capture fails)
+
+If the Step 0.4 sanity check fails for any stage (capture too short, missing KLang signals, etc.):
 
 1. Resolve `<JWT>` — Playwright profile → env var `KOGNITOS_JWT` → ask user to paste.
 2. `listProcedureGroupsByDepartmentv2({ departmentId: <DEPT_ID> })` once → catalog mapping every procedure ID → name + `latestRunData.id`.
@@ -203,9 +216,37 @@ If sanity check fails at Step 0.4 for any stage:
 4. Render the sentence list back to indented text by walking `parentId` chains (each level = 2 spaces). Embedded multi-line strings (e.g. `text` containing `\n`) reproduce verbatim.
 5. Save to the same `stage<N>_<slug>.txt` path. Note `klang_source: "api_render"` in `_hydration.json` for that stage.
 
-Edge case: a child procedure exists in the catalog but `latestRunData` is null (never been run). Surface as a blocker. (Rare for published automations.)
+Edge cases that escalate to Step 0.8 (user paste):
+- A child procedure exists in the catalog but `latestRunData` is null (never been run) — API can't fetch its KLang.
+- `api.app.kognitos.com` is unreachable / 5xx.
+- JWT refresh fails repeatedly.
 
-#### Step 0.8 — Write `_hydration.json`
+#### Step 0.8 — User-paste fallback (Tier 3, when both Playwright and API fail)
+
+When both Tier 1 (copy-capture) and Tier 2 (API render) fail for a stage, the agent prompts the user to paste KLang manually. This is the same workflow SEs used pre-automation, kept as a safety net.
+
+Procedure:
+
+1. Agent prints a clear prompt:
+   ```
+   ⚠️  Auto-capture failed for stage <N> ("<stage_name>").
+       Tier 1 (Playwright): <reason — e.g. "Slate copy returned empty">
+       Tier 2 (API): <reason — e.g. "no latestRunData for procedure id <id>">
+
+   Please paste the KLang manually:
+     1. Open: <child URL>
+     2. Click into the editor, Cmd+A then Cmd+C
+     3. Save the result to: <OUTPUT_BASE_DIR>/klang/stage<N>_<slug>.txt
+     4. Reply "done" when complete.
+   ```
+2. Wait for the user's `done` confirmation (or timeout / abort).
+3. Re-read the saved file. Sanity-check (same as Step 0.4: length > 100, contains KLang signals).
+4. Note `klang_source: "user_paste"` in `_hydration.json` for that stage.
+5. Continue Phase 0 from the next stage or recursion step.
+
+The user-paste path produces text identical to what Tier 1 would produce (the user is using the same editor copy serializer). The only difference is the human in the loop.
+
+#### Step 0.9 — Write `_hydration.json`
 
 ```json
 {
@@ -302,7 +343,20 @@ Write `branch_catalog.md` (human-readable) and `branch_catalog.json` (machine-re
 
 ### Phase B — Run discovery & branch-coverage triage (API-first, parallel)
 
-Pure API; runs ~100 runs in 10-20 seconds wall-clock. Fallback procedure is Appendix A.1.
+**What this phase does:** Find one representative production run per major branch, so Phase C only does expensive deep captures on the ~10-20 runs that matter, not all ~100-200 recent runs in the sample window.
+
+**Why this matters.** Deep capture (Phase C) takes 1-5 minutes per run — API trace fetch, recursion into sub-documents, UI work for FILE binaries and `__large_value_*` resolution. If you skip triage and deep-capture everything, that's hours of wall-clock. If you skip triage and pick runs by eye, you'll miss niche branches that show up in 1% of runs. Phase B's "shallow fingerprint" approach takes 10-20 seconds total and gives Phase C a precise shortlist.
+
+**How it works.** Two operations bracket a parallel scan:
+
+1. **One** `getWorkerDocument` call (B.2) — gives the lineId → predicate-text map. Every run of the same KLang version shares the same lineIds, so this map is reusable across all runs. Fetching it once instead of per-run is the difference between 100 calls and 1 call.
+2. **N parallel** `getSentenceExecutionData` calls (B.3) — one per candidate run, ~10 concurrent. For each run, the agent inspects which decision-line lineIds were `Met`/`Not Met` to compute a "fingerprint" (the set of branches that run exercised). All fingerprints feed B.4.
+
+**Output:** `_branch_triage.json` — for each branch in `branch_catalog.json`, lists candidate runs and picks a `chosen` representative. Phase C reads this file to know which runs to deep-capture. Branches with zero candidates show up as `coverage_gaps` for the SE to expand the sample window or accept the gap.
+
+**Why fingerprinting beats arbitrary selection:** without B.3, you'd pick runs by recency or eyeballing the UI. That works for the obvious 80% of branches and silently misses the long tail. Fingerprinting EVERY recent run is cheap (parallel shallow API calls) and guarantees branch-level coverage decisions are auditable.
+
+Fallback procedure (when `ListWorkersByProcedure` is unreachable) is Appendix A.1.
 
 #### Step B.1 — List runs
 
