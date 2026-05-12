@@ -4,12 +4,12 @@ Agent-facing instructions. Auto-loaded when Claude Code works in this directory.
 
 ## Where the migration workflow lives
 
-This repo holds *reference assets only*. The actual migration runbook lives in the `golem` repo:
+The migration runbook lives in this repo under `specs/`:
 
-- `golem/specs/migration-step-1-data-collection-merged.md` — Phase 0 (Hydration) + Phases A-D (data collection)
-- `golem/specs/migration-step-2-3-combined-template.md` — Phases A (SOP) + B (SPy iteration)
+- `specs/migration-step-1-data-collection.md` — Phase 0 (Hydration) + Phases A-D (data collection)
+- `specs/migration-step-2-3-combined.md` — Phases A (SOP drafting) + B (SPy iteration)
 
-When an agent is invoked for a migration, it reads one of those specs as its instructions. Files in this repo are referenced by absolute path from those specs (e.g. `~/kognitos-migration-assets/run_capture_template.md`).
+When an agent is invoked for a migration, it reads one of those specs as its instructions. Other files in this repo (`run_capture_template.md`, `example_filled_capture/`) are referenced by absolute path from those specs (e.g. `~/kognitos-migration-assets/run_capture_template.md`).
 
 ## Output directory naming
 
@@ -30,10 +30,9 @@ Phase 0 produces one `.txt` per stage at `<OUTPUT_BASE_DIR>/klang/stage<N>_<chil
 
 ## Editor automation (Slate)
 
-The Kognitos editor is Slate.js. Selector is `#slate-editor`. For KLang copy-capture, the listener install + select + copy + read MUST run in **one** `browser_evaluate` call. See `golem/specs/migration-step-1-data-collection-merged.md` Step 0.4 for the pinned procedure.
+The Kognitos editor is Slate.js. Selector is `#slate-editor`. For KLang copy-capture, the listener install + select + copy + read MUST run in **one** `browser_evaluate` call. See `specs/migration-step-1-data-collection.md` Step 0.4 for the pinned procedure.
 
 ## What this repo is NOT for
 
 - Per-customer artifacts (those live in the customer's directory, e.g. `plunkett/<automation_slug>/`)
 - Per-automation run captures (those live in `<OUTPUT_BASE_DIR>/run_captures/`)
-- The migration spec itself (that's in `golem`)
