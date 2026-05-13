@@ -2,6 +2,10 @@
 
 Agent-facing instructions. Auto-loaded when Claude Code works in this directory.
 
+## If a HANDOFF.md exists, read it first
+
+If `HANDOFF.md` exists at the root of this repo, it summarizes the most recent work session (what was done, what's untested, what's next, gotchas to avoid). Read it before making changes. It supersedes anything outdated in this file.
+
 ## Where the migration workflow lives
 
 The migration runbook lives in this repo under `specs/`:
