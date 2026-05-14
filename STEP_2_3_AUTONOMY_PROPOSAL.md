@@ -42,7 +42,7 @@ Scoring:
 | # | Improvement | Impact | Effort | Cluster |
 |---|---|---|---|---|
 | 1 | Workspace book-inventory preflight | High | Low | **Up-front** |
-| 2 | Interactive Astral path (exception resolution) | High | Medium | **Discuss first** |
+| 2 | Interactive Astral path (exception resolution) | High | Medium | **Spec'd — calibrate after migration #1** |
 | 3 | Book-contract check in loop | High | Medium | **Discuss first** |
 | 4 | Diff-shape monotonicity tracker | High | Low-Med | **Up-front** |
 | 5 | Plan-validation strictness | Medium | Low | **Up-front** |
@@ -62,12 +62,19 @@ Scoring:
 - **Why now:** turns a class of mid-loop failure into a pre-flight failure. Zero risk to spec; purely additive.
 - **Effort:** ~50 lines + small spec section.
 
-#### 2. Interactive Astral path
-- **Today:** spec is read-only on `kognitos_reply_to_exception`. Exception resolution agent's reasoning is used as fix-context for Quill but never engaged interactively.
-- **Change:** When a V2 run pauses on an exception, attempt **one** strict round-trip with Astral: reply with the V1 ground-truth for the failing line (predicate text + expected binding values from V1's trace). If Astral resolves the exception in that one reply, the run completes and we go directly to the diff path — potentially achieving parity without a Quill iteration. If not, fall back to read-only fix-context and treat the failed Astral round-trip as additional context in the Quill plan.
-- **Why now:** Astral round-trips might be the cheapest path to parity for whole classes of errors (missing context, ambiguous bindings). This is the only proposed change that touches the read-only invariant in the spec, so it needs explicit go-ahead.
-- **Risk:** circularity (Astral's interactive reply influences future Astral runs on the same exception) and side effects (advancing the run mutates state). Mitigations: one reply per exception; the reply content is mechanical V1 ground truth, not agent reasoning; capture before/after exception state for audit.
-- **Effort:** medium. Mostly design (reply template, audit shape, fall-through semantics).
+#### 2. Interactive Astral path — **SPEC'D 2026-05-14**, awaiting calibration data
+- **Status:** drafted as "Astral diagnostic engagement" in `specs/migration-step-2-3-combined.md` under the Exception path section.
+- **Final design:** diagnostic-first reply framing (ask for explanation, not for a runtime patch), 3-turn cap per exception, mandatory guide-snapshot before/after, terminate on guide drift, harvested diagnosis feeds Quill via Pattern 1. Opt-in per a clear when-to-engage table. Read-only is the default; engagement is opt-in for thin-bundle cases or post-failure retries.
+- **Key findings that shaped the design:**
+  - Guidance-center writes are gated on a UI button the agent cannot press. Risk of accidental write is low in normal flow; we still snapshot to detect anomalies.
+  - The MCP has no `delete_guide` / `archive_guide`. If a guide leaks, manual UI cleanup is the only path. Spec terminates the loop and surfaces to SE rather than attempting auto-cleanup.
+  - The "runtime patch on the current run" is ephemeral and doesn't carry forward. Re-running the fixed SPy starts clean.
+  - We have zero real Astral interaction data from this pipeline. Spec is intentionally conservative; calibration after migration #1.
+- **Calibration questions to answer after migration #1:**
+  - Does Astral respect diagnostic framing or always patch anyway?
+  - Is the harvested diagnosis usable as Quill fix-context (net-positive vs read-only)?
+  - Did guide drift occur, and if so, on what kind of replies?
+  - What was the actual round-trip count? Tighten or loosen the cap accordingly.
 
 #### 3. Book-contract check in loop
 - **Today:** `book_broken_procedure` requires 2 identical iterations with no SPy change on the failing line.

@@ -477,7 +477,108 @@ Procedure:
    }
    ```
 
-Do NOT auto-reply to the exception via `kognitos_reply_to_exception` from the iteration loop — that's interacting with Kognitos's own resolution agent, which can produce side effects (advancing the run, triggering further exceptions). The exception is read-only fix-context for Quill.
+**Read-only baseline (no reply):** if the exception bundle has enough context for Quill to write a fix, stop here, pass `iteration_<N>_exception.json` as fix-context, and skip the diagnostic-engagement step below. The Astral interaction is opt-in, not default.
+
+### Astral diagnostic engagement (opt-in extension of the exception path)
+
+When the read-only exception bundle is too thin to construct a useful Quill fix prompt — e.g., the resolution thread has only Astral's initial reasoning, the exception text doesn't pin down the root cause, or the diagnosis depends on context the agent hasn't surfaced — engage Astral conversationally to extract a better diagnosis. **The output is improved Quill fix-context, not a runtime patch.**
+
+#### Background on Astral
+
+Astral (Kognitos's exception resolution agent) responds to exceptions by reasoning about the failing SPy line and, when given enough context, writing a **runtime patch** that lets the current run continue. The patch is bound to the run; it does not edit the automation's SPy source. A patch is added to the workspace's troubleshooting guide ONLY when the user explicitly presses an "Add to troubleshooting guide" button in the UI — the MCP cannot perform that action. The MCP has no way to delete a guide entry; cleanup is UI-only.
+
+The migration agent's goal is **diagnosis from Astral, permanent fix in SPy via Quill**. Never adopt Astral's runtime patch as the long-term answer.
+
+#### Procedure
+
+1. **Snapshot guides:** `kognitos_inspect_exceptions(list_guides, automation_id=<v2_draft>)` → record `guides_before` (id + signature for each). This is the drift baseline.
+2. **Reply with diagnostic framing**, not a directive. Use `kognitos_reply_to_exception(automation_id, run_id, exception_id, message=<below>)`:
+
+   ```
+   I am migrating this automation from V1 to V2. The SPy line that just
+   failed has a known V1 equivalent. In the V1 run captured for the same
+   input:
+
+     - the line was: <V1 KLang text for the corresponding statement>
+     - the bindings produced were: <name=value, name=value, ...>
+     - the branch decision was: <Met / Not Met for predicates>
+
+   I do NOT want you to patch the run at runtime. I want to fix the V2
+   SPy source so this exception never occurs again on subsequent runs.
+
+   Please describe, in concrete terms:
+     - what specifically in the current SPy at this line is wrong
+       compared to the V1 behavior above,
+     - what the SPy should say instead to produce the V1 binding/decision,
+     - whether the fix is a value, a predicate, a binding name, or a
+       structural change.
+
+   Do not write a runtime patch and do not add anything to the
+   troubleshooting guide.
+   ```
+
+3. **Poll** `kognitos_inspect_exceptions(list_events, exception_id)` for Astral's response. Concurrently poll `kognitos_runs(get, run_id)` to detect whether the run advanced (Astral applied a patch despite the diagnostic framing).
+4. **Three observable outcomes:**
+   - Astral responds with diagnosis text, run state unchanged → ideal. Harvest the diagnosis.
+   - Astral responds with diagnosis text AND applies a patch (run state advances) → also fine. Harvest the diagnosis; treat the patch as additional context, not as the answer.
+   - Astral responds with only a clarifying question → optional one more reply with the requested context. **Total cap: 3 round-trips per exception** including the first. Past 3, abort the engagement.
+5. **Snapshot guides again:** `list_guides` → `guides_after`. Compute `drift = guides_after \ guides_before`.
+   - If `drift` is empty → continue.
+   - If `drift` is non-empty → write `<OUTPUT_BASE_DIR>/spy_iterations/stage<N>/iteration_<N>_astral_guide_drift.json` with the new guide id(s) + content, and **emit `migration_outcome.json` with terminal state `platform_bug` (subcategory: `astral_unexpected_guide_write`)**. Stop the iteration. The SE deletes the guide via the UI before resuming.
+6. **Write the full Astral thread** to `<OUTPUT_BASE_DIR>/spy_iterations/stage<N>/iteration_<N>_astral_thread.json` with shape:
+
+   ```json
+   {
+     "iteration": "<N>",
+     "stage": "<N>",
+     "branch": "<id>",
+     "v2_run_id": "<run_id>",
+     "exception_id": "<exception_id>",
+     "turns": [
+       { "author": "agent", "text": "<reply 1>" },
+       { "author": "astral", "text": "<response 1>", "run_state_after": "waiting_for_user_input" },
+       { "author": "agent", "text": "<reply 2>" },
+       { "author": "astral", "text": "<response 2>", "run_state_after": "done" }
+     ],
+     "guides_before": [ /* snapshot */ ],
+     "guides_after": [ /* snapshot */ ],
+     "drift": [ /* guides_after \ guides_before */ ],
+     "harvested_diagnosis": "<the most actionable text from Astral's responses, paraphrased only if necessary>"
+   }
+   ```
+
+   This file is required for every Astral engagement. It is the calibration data set — the design of this section will be revised after the first 1–2 migrations produce real transcripts.
+
+7. **Construct the Quill fix prompt** using `harvested_diagnosis` as part of the fix-context (alongside the original exception bundle and the V1 trace excerpt). Send to Quill via Pattern 1 (plan first → validate → implement).
+8. **Mandatory verification re-run.** Invoke the new SPy candidate fresh against the same input. If the same exception fires again, the harvested diagnosis was wrong; **on retry, do NOT engage Astral again for this exception signature** — fall back to the read-only exception bundle as fix-context for Quill. Repeated Astral engagements on the same exception are not allowed within a single (stage, branch) iteration chain.
+
+#### When to opt in vs stay read-only
+
+| Situation | Default |
+|---|---|
+| Exception has a clear, attributable cause in the exception text (e.g. "field `X` is missing in payload, available fields are: …") | **Read-only.** Quill can fix from the bundle alone. |
+| Resolution thread has only Astral's initial reasoning, no follow-up | **Engage** if iteration count > 1 (i.e., a prior Quill attempt already failed; the bundle wasn't enough). |
+| Exception is a generic platform error (5xx, timeout) | **Read-only.** Astral can't diagnose what the platform itself broke. |
+| Branch is `accepted-risk` (no V1 reference) | **Do not engage.** Without V1 ground truth to share, the diagnostic reply has no anchor. Use the exception bundle and SE escalation. |
+
+#### Hard rules
+
+- Never tell Astral to add anything to the troubleshooting guide.
+- Never accept Astral's runtime patch as the final fix. The SPy source is the source of truth.
+- 3-turn cap per exception. No exceptions to the cap until the calibration data justifies a change.
+- One Astral engagement per `(stage, branch, exception_signature)` per iteration chain. If the same exception recurs after a Quill fix, the second attempt is read-only.
+- If `list_guides` drifts, terminate the loop and surface to the SE. The MCP cannot clean up; manual UI deletion is the only path.
+
+#### Calibration TODO (revise this section after migration #1)
+
+After the first PO digitization migration completes, review every `iteration_<N>_astral_thread.json` and answer:
+
+- Does Astral respect the diagnostic framing, or does it always patch regardless? (If always patches: simplify the reply template to be more directive, since softening doesn't help.)
+- Is the harvested diagnosis usable as Quill fix-context, or does Quill consistently produce worse plans with it than without? (If worse: the engagement is net-negative; revert to read-only.)
+- Did guide drift occur? On what kind of replies? (If yes: harden the language of the reply.)
+- What was the average round-trip count? (Calibrate the cap.)
+
+Track answers in `STEP_2_3_AUTONOMY_PROPOSAL.md` under proposal #2.
 
 ### Fix prompt template (used in iteration step 6)
 
@@ -535,7 +636,8 @@ No new design decisions. If you discover the plan is incomplete, stop and ask.
 - For `accepted-risk` branches, the synthesized test fixture must drive the branch and the SPy must produce a self-consistent end-state — but no production-trace diff is possible.
 - For `accepted-risk` branches, the SPy MUST implement the V1 logic verbatim (translated to SPy) AND include an explicit untested-branch marker (see "Stubbing unobserved branches" below). Do not omit the branch, simplify it, or replace it with a TODO.
 - Every Quill interaction in this phase uses Pattern 1 (plan first, then implement). No exceptions.
-- Fix-context attached to a Quill fix prompt comes from real run evidence — the diff JSON or the exception bundle. Never from the orchestrator's hypothesis about what *might* have gone wrong.
+- Fix-context attached to a Quill fix prompt comes from real run evidence — the diff JSON, the exception bundle, or (when opted in) a harvested Astral diagnosis. Never from the orchestrator's hypothesis about what *might* have gone wrong.
+- Astral diagnostic engagement is opt-in per the "When to opt in vs stay read-only" table. The 3-turn cap and the guide-drift gate are hard limits. The MCP has no programmatic way to clean up a leaked guide entry; drift terminates the iteration and surfaces to the SE.
 
 ### Stubbing unobserved branches (accepted-risk)
 
