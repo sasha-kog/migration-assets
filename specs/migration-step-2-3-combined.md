@@ -9,8 +9,8 @@ Use this combined template when you want one execution for SOP drafting followed
 
   | Stage | Automation Name | KLang path | Current published version label |
   |-------|-----------------|------------|----------------------------------|
-  | 0 | `<orchestrator name>` | `<klang_path>` | `<label, e.g. "Apr 2026">` |
-  | 1 | `<child name>` | `<klang_path>` | `<label>` |
+  | 0 | `<orchestrator name>` | `<source_path>` | `<label, e.g. "Apr 2026">` |
+  | 1 | `<child name>` | `<source_path>` | `<label>` |
   | 2 | … | … | … |
 
 - `<RUN_CAPTURES_GLOB>` (for example: `plunkett/<automation_slug>/run_captures/**`)

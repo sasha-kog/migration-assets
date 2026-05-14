@@ -29,7 +29,8 @@
           "properties": {
             "stage_name": { "type": "string", "minLength": 1 },
             "automation_id": { "type": "string", "minLength": 1 },
-            "klang_path": { "type": "string" },
+            "language": { "type": "string", "enum": ["klang", "spy"] },
+            "source_path": { "type": "string" },
             "book_requirements": {
               "type": "array",
               "items": { "$ref": "#/$defs/book_requirement" }
