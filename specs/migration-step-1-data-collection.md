@@ -50,8 +50,8 @@ The agent commits to a path before loading procedures. Re-check these rules only
 
 ### Use the API path (primary) unless any of:
 
-- `<JWT>` returns 401 twice in a row after the user provides a fresh token.
-- `api.app.kognitos.com` is unreachable (DNS / network).
+- **Apollo Client init fails twice** (`window.__APOLLO_CLIENT__` undefined after waiting for `#slate-editor`) — the page is either logged out, broken, or on a Kognitos version that doesn't expose the client globally.
+- `app.kognitos.com` is unreachable (DNS / network).
 - `ListWorkersByProcedure` returns zero usable runs for `<PROCEDURE_ID>`.
 
 If any of those: switch to **Appendix A — UI fallback** for run discovery + KLang collection + per-run branch traces.
@@ -59,10 +59,11 @@ If any of those: switch to **Appendix A — UI fallback** for run discovery + KL
 ### UI work is REQUIRED even in API mode, in all cases, for:
 
 - **FILE binaries** — signed S3 URLs are obtainable only by clicking the file element in the editor. Procedure: Phase C step 6.3 sub-A.
-- **`__large_value_NNNN` JSON resolution** — when a downstream branch reads a concept whose `display_value` is `__large_value_*`. Procedure: Phase C step 6.3 sub-C. (TODO: identify the GraphQL op the value-badge popover hits; eliminates this UI step.)
 - **SSO login** if the Playwright profile is logged out.
 
-These are not fallback paths — they're always required in API mode, batched into one UI pass per run at the end of Phase C.
+`__large_value_*` resolution is **NOT** in this list any more. `GetHistoricalFacts` (Apollo Client) resolves STRING/JSON/FILE concepts in one batched call; the UI badge click is needed only for the binary-download step of FILE-typed values (the `value` returned by `GetHistoricalFacts` for a FILE is the raw `s3://` URI, not a signed HTTPS URL). See "How `__large_value_NNNN` actually works" for the full procedure.
+
+The remaining UI-mode requirements are batched into one UI pass per run at the end of Phase C.
 
 ### Don't switch lanes mid-run
 
@@ -74,7 +75,7 @@ If you start a run in API mode and Phase C step N fails, finish what you can for
 
 - Agent uses the Playwright MCP browser. The MCP profile is single-instance — if a stale Chrome from a prior session holds it, surface that as a blocker. Do **not** kill the PID without authorization.
 - If `app.kognitos.com` requires SSO/manual login, pause and request manual login handoff via the MCP browser, then resume.
-- A logged-in Playwright profile can supply the JWT itself: navigate to any run page, capture the next `graphql?op=…` request's `authorization` header. Falls back to user-pasted `<JWT>` if the profile isn't logged in.
+- **JWT use is narrow.** Run-data GraphQL ops go through Apollo Client inside `browser_evaluate` (see "Authentication" — direct curl/fetch returns 401 in current production). A JWT is required only for two things: (a) GETting an `answerOffloadedUrl` / `conceptsOffloadedUrl` payload, and (b) `curl` of signed S3 URLs captured after a UI click. For both, capture the JWT from a logged-in Playwright profile by navigating to any run page and reading the next `graphql?op=…` request's `authorization` header. If the profile isn't logged in, pause and ask the user to log in via the MCP browser. Pasted JWTs are accepted but rarely needed.
 
 ---
 
@@ -82,17 +83,17 @@ If you start a run in API mode and Phase C step N fails, finish what you can for
 
 The agent runs these in order. Each phase has a clear input and output.
 
-| Phase | Input | Output | API/UI |
+| Phase | Input | Output | Path |
 |---|---|---|---|
-| **0** Hydration | `<PROCESS_PUBLISHED_URL>` | `_hydration.json`, `klang/stage<N>_<slug>.txt` per stage, derived `<OUTPUT_BASE_DIR>` | UI (Playwright copy-capture, primary) + API (fallback) |
-| **A** Branch enumeration | KLang `.txt` per stage | `branch_catalog.{md,json}` | text only |
-| **B** Run discovery + triage | `branch_catalog.json` + `<PROCEDURE_ID>` + `<DEPARTMENT_ID>` | `_orchestrator_runs_index.json`, `_branch_triage.json` | API (UI fallback in Appendix A.1) |
-| **C** Per-run deep capture | shortlist from `_branch_triage.json` | per-run folder with all artifacts | API + one batched UI pass per run |
-| **D** Aggregate | all per-run folders | `_capture_index.json`, optionally `_klang_version_evolution.md` | none |
+| **0** Hydration | `<PROCESS_PUBLISHED_URL>` | `_hydration.json`; `klang/stage<N>_<slug>.txt` per KLang stage; `python/stage<N>_<slug>.py` per Python stage; derived `<OUTPUT_BASE_DIR>` | Playwright (Slate copy-capture for KLang, CodeMirror `innerText` for Python) + Apollo Client fallback for unreachable editors |
+| **A** Branch enumeration | KLang `.txt` files only (Python stages skipped) | `branch_catalog.{md,json}` covering KLang stages | text only |
+| **B** Run discovery + triage | `branch_catalog.json` + `<PROCEDURE_ID>` + `<DEPARTMENT_ID>` | `_orchestrator_runs_index.json`, `_branch_triage.json` (B.5 payload sweep + B.6 sub-document branch sweep populate gaps) | Apollo Client via Playwright (UI fallback in Appendix A.1) |
+| **C** Per-run deep capture | shortlist from `_branch_triage.json` | per-run folder with all artifacts (KLang stage traces + parent-trace records of Python procedure calls) | Apollo Client + one batched UI pass per run (FILE binaries only) |
+| **D** Aggregate | all per-run folders | `_capture_index.json`, optionally `_klang_version_evolution.md` (KLang stages only) | none |
 
 ### Phase 0 — Hydration (one URL → everything else)
 
-**Goal:** Derive every other input from `<PROCESS_PUBLISHED_URL>` alone. By the end, the agent has KLang text for the orchestrator and every child procedure, plus a `_hydration.json` linking them.
+**Goal:** Derive every other input from `<PROCESS_PUBLISHED_URL>` alone. By the end, the agent has captured source code for the orchestrator and every child procedure — KLang text (Slate editor) for KLang stages, Python source (CodeMirror editor) for Python stages — plus a `_hydration.json` linking them with the correct `language` per stage.
 
 **Primary path = Playwright copy-capture.** The editor is Slate.js; its `copy` event handler serializes the full document with `[md*]` references resolved inline and indentation as literal whitespace. We capture that. Verified against a 290-line automation (`create customer payment`): byte-identical to manual highlight + copy + paste, in fact one line MORE complete than manual paste (which silently truncated the last line).
 
@@ -331,7 +332,7 @@ The user-paste path produces text identical to what Tier 1 would produce (the us
     "automation_name": "create customer payment",
     "automation_slug": "create_customer_payment",
     "output_base_dir": "create_customer_payment/",
-    "jwt_source": "playwright_profile|env|paste|none-yet"
+    "jwt_source": "playwright_profile|paste|none-yet"
   },
   "stages": [
     {
@@ -341,7 +342,7 @@ The user-paste path produces text identical to what Tier 1 would produce (the us
       "language": "klang",
       "source_path": "klang/stage0_create_customer_payment.txt",
       "source_capture_method": "copy_capture",
-      "child_procedure_ids_static": ["6szk1unn9661xjtf9uhpflrja"],
+      "child_procedure_ids_static": ["6szk1unn9661xjtf9uhpflrja", "ewifvybk2jhnmj6030zyjbhij"],
       "discovered_via": "url"
     },
     {
@@ -351,6 +352,18 @@ The user-paste path produces text identical to what Tier 1 would produce (the us
       "language": "klang",
       "source_path": "klang/stage1_update_the_case.txt",
       "source_capture_method": "copy_capture",
+      "klang_hash": "v2_f9987da9bd5aac783554b22672febfce",
+      "child_procedure_ids_static": [],
+      "discovered_via": "klang_static_parse_from_stage_0"
+    },
+    {
+      "stage_number": 2,
+      "procedure_id": "ewifvybk2jhnmj6030zyjbhij",
+      "name": "to download a document from azure_blob_storage",
+      "language": "python",
+      "source_path": "python/stage2_to_download_a_document_from_azure_blob_storage.py",
+      "source_capture_method": "copy_capture",
+      "klang_hash": null,
       "child_procedure_ids_static": [],
       "discovered_via": "klang_static_parse_from_stage_0"
     }
@@ -368,7 +381,7 @@ The user-paste path produces text identical to what Tier 1 would produce (the us
 }
 ```
 
-Phases A-D consume `_hydration.json` and the `klang/*.txt` files — they do NOT re-fetch what Phase 0 has already produced.
+Phases A-D consume `_hydration.json`, `klang/*.txt` (KLang stages), and `python/*.py` (Python stages) — they do NOT re-fetch what Phase 0 has already produced.
 
 #### Risks / known unknowns
 
@@ -378,7 +391,7 @@ Phases A-D consume `_hydration.json` and the `klang/*.txt` files — they do NOT
 - **Login token expiry mid-Phase-0** — for a multi-child pipeline, the session might expire between captures. Detect by 401 or login redirect on `browser_navigate`; pause for re-auth, then resume.
 - **Procedures with zero published runs** — only affects the API fallback path. Copy-capture works fine without runs.
 
-#### Verified end-to-end on `create customer payment`
+#### Verified end-to-end on `create customer payment` (all-KLang case, 2026-05-12)
 
 A full Phase 0 walk on this orchestrator produced (in this order):
 
@@ -388,6 +401,20 @@ A full Phase 0 walk on this orchestrator produced (in this order):
 4. Final `_hydration.json` lists 2 stages, 1 deferred miniPlayground (`extract data from the document`), 0 warnings.
 
 Total time: <30 seconds after SSO login. Zero human interaction post-login.
+
+#### Verified end-to-end on `to perform PO digitization` (mixed-language case, 2026-05-14)
+
+The first mixed-language Phase 0 walk. Exercised Pass 2 procedure-name discovery, editor-type detection (Slate vs CodeMirror), and the new `python/` storage path:
+
+1. `klang/stage0_to_perform_po_digitization.txt` captured via Slate copy-capture — 3,655 chars. Pass 1 regex found zero `run @{...}` references. Pass 2 against `listProcedureGroupsByDepartmentv2` found 3 children referenced as bare verb phrases: `convert a PO pdf to json`, `send a final output response`, `download a document from azure_blob_storage`.
+2. Editor-type detection at each child URL:
+   - `to send a final output response` → Slate → captured to `klang/stage2_*.txt` (1,317 chars).
+   - `to convert a PO pdf to json` → Slate → captured to `klang/stage3_*.txt` (45,725 chars; large `[md*]` extraction prompts fully resolved).
+   - `to download a document from azure_blob_storage` → CodeMirror → captured to `python/stage1_*.py` (2,339 chars; `@procedure` decorator + `import requests`).
+3. Recursion: Pass 2 on stage 3's KLang surfaced two more Python children (`add a attachment to JSON template`, `update a JSON template`) → captured to `python/stage4_*.py` and `python/stage5_*.py`. No further recursion (Python stages are opaque per Step 0.5).
+4. Final `_hydration.json` lists 6 stages: 3 KLang (`language: "klang"`) + 3 Python (`language: "python"`), 3 deferred loop bodies in `runtime_only_blocks`.
+
+Confirms: Pass 2 procedure-name matching is required (Pass 1 alone missed 100% of children); editor-type detection correctly routes Python to `python/`; recursion terminates at Python stages without scanning their source for verb matches.
 
 ### Phase A — Branch enumeration (KLang stages only — Python stages skipped)
 
@@ -644,7 +671,9 @@ For each representative run in `_branch_triage.json`, in this order:
 
 ### Phase D — Aggregate index + version evolution
 
-Walk every run folder; aggregate per-stage comparability + branches exercised into `_capture_index.json` (schema below). If any stage shows ≥ 2 distinct KLang versions across the sample, write `_klang_version_evolution.md`.
+Walk every run folder; aggregate per-stage comparability + branches exercised into `_capture_index.json` (schema below). If any **KLang** stage shows ≥ 2 distinct `klang_hash` values across the sample, write `_klang_version_evolution.md`.
+
+**Python stages are skipped from version aggregation.** They have no `klang_hash` (null in `_hydration.json` by design); if their source has changed across the sample window, that's a code-level diff which is out of scope for this phase. Record Python stages in `_capture_index.json` with `current_version_label: "Python — no KLang hash"` and a stable comparability of `current` unless explicitly overridden.
 
 ---
 
@@ -679,7 +708,9 @@ To call `<op>` from inside Playwright: navigate to any authenticated app page fi
 
 **No curl/fetch fallback for run-data ops.** The historical curl pattern documented in earlier versions of this spec is removed — it doesn't work against the production audiences. The only place curl is still used in Phase C is to GET signed S3 URLs that the UI hands us after a click (and even then, the URL came from a network capture, not from a GraphQL call).
 
-## The three queries
+## GraphQL queries used (four)
+
+All run through Apollo Client via `browser_evaluate` — see "Authentication" for the pattern.
 
 ### `ListWorkersByProcedure` — runs list
 
@@ -711,6 +742,22 @@ query getSentenceExecutionData($workerId: ID!, $token: String, $documentToken: S
 ```
 
 `answer` and `concepts` are JSON-encoded **strings**. `json.loads(...)` them before extracting.
+
+### `GetHistoricalFacts` — resolve `__large_value_*` placeholders
+
+```graphql
+query GetHistoricalFacts($knowledgeId: ID!, $factIds: [HistoricalFactID!]!) {
+  getHistoricalFacts(knowledgeId: $knowledgeId, factIds: $factIds) {
+    id names type value valueOffloadedUrl
+  }
+}
+```
+
+- `knowledgeId` = the run's knowledgeId (from `ListWorkersByProcedure.items[].knowledgeId`).
+- `factIds` = `[{id: <concept_id>, epoch: <epoch>}, ...]` — both fields come from `getSentenceExecutionData` entries (concept_id from `JSON.parse(entry.answer).__concept__.id` or `entry.concepts`; epoch from `entry.epoch`).
+- Returns the actual value for STRING/JSON/FILE concepts (FILE returns the raw `s3://` URI). Batch many `factIds` per call.
+
+This replaces the now-broken `FactsAtLineId` op. See "How `__large_value_NNNN` actually works" for the full resolution procedure.
 
 ---
 
@@ -1083,15 +1130,18 @@ Branch by what kind of capture is needed.
 1. Navigate into the child run page via the purple subprocess icon (see "Sub-process navigation").
 2. On the child's run page, repeat A's steps with `ui_capture_target: "stage<N>_input.<ext>"`.
 
-#### C. Large JSON value (badge click)
+#### C. Large value resolution — OBSOLETE for non-FILE types
 
-1. Navigate to the stage where the value first appears (orchestrator tab, child tab, etc — known from `produced.concept_id` plus the stage that produced it; if uncertain, any line where the concept is referenced works).
+Use `GetHistoricalFacts` (Apollo Client) instead of UI badge clicks for STRING / JSON / FILE-URI resolution. See "How `__large_value_NNNN` actually works" for the procedure. One batched call replaces N badge clicks.
+
+The badge-click path is retained ONLY as the fallback when `GetHistoricalFacts` itself fails (rare; flag as a tripwire if it does). If you do fall back:
+
+1. Navigate to the stage where the value first appears.
 2. Find the line by searching the editor's DOM for the predicate text.
-3. Within that row, find the `{ }` value badge for the relevant binding name (e.g. the badge next to "the customerRecord").
-4. Click it.
-5. Capture the popover's network request response body via `browser_network_requests`. (TODO: pin the GraphQL op name once observed.)
-6. Save the JSON to `<run_folder>/<ui_capture_target>` (e.g. `stage0_3acfef0b_customerrecord.json`).
-7. Update the record (and any other records sharing the same `concept_id`): `ui_capture_status: "captured"`, `ui_capture_path: "<ui_capture_target>"`.
+3. Within that row, find the `{ }` value badge for the relevant binding name.
+4. Click it and capture the popover's response body via `browser_network_requests`.
+5. Save the JSON to `<run_folder>/<ui_capture_target>`.
+6. Update the record (and any other records sharing the same `concept_id`): `ui_capture_status: "captured_via_ui_fallback"`, `ui_capture_path: "<ui_capture_target>"`.
 
 ### Edge cases
 
