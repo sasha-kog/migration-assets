@@ -533,8 +533,41 @@ No new design decisions. If you discover the plan is incomplete, stop and ask.
 - Explicitly validate handoff payload keys at the pipeline boundary: `<HANDOFF_FIELDS>`.
 - Treat `<DOWNSTREAM_BOUNDARY_NAME>` as boundary unless explicitly in scope.
 - For `accepted-risk` branches, the synthesized test fixture must drive the branch and the SPy must produce a self-consistent end-state — but no production-trace diff is possible.
+- For `accepted-risk` branches, the SPy MUST implement the V1 logic verbatim (translated to SPy) AND include an explicit untested-branch marker (see "Stubbing unobserved branches" below). Do not omit the branch, simplify it, or replace it with a TODO.
 - Every Quill interaction in this phase uses Pattern 1 (plan first, then implement). No exceptions.
 - Fix-context attached to a Quill fix prompt comes from real run evidence — the diff JSON or the exception bundle. Never from the orchestrator's hypothesis about what *might* have gone wrong.
+
+### Stubbing unobserved branches (accepted-risk)
+
+When a branch has `coverage_quality == "accepted-risk"` (no `current` or `near-current` capture, and the Phase B.5 trigger-payload sweep also returned zero), the SPy must still implement the V1 logic — but with a clear marker so future SEs, customer reviewers, and the agent itself know this code has never been exercised.
+
+The rationale: dead-code-looking branches sometimes turn out to be live (a trigger schema change, a new vendor, a edge case that finally occurs). Stripping them out makes the V2 a behavioral regression. Keeping them verbatim but marked makes the risk visible.
+
+**Implementation requirement (in the SPy):**
+
+1. Translate the V1 KLang for the branch to SPy, line-for-line. Preserve predicate text, binding names, and any sub-process invocations exactly. Do NOT simplify, refactor, or omit.
+2. Add a leading SPy comment at the top of the branch's body:
+
+   ```spy
+   # UNTESTED BRANCH — accepted-risk
+   # Source: V1 KLang for <stage_name>, predicate "<verbatim predicate>"
+   # Reason: no representative run found in Step 1 (and Phase B.5 sweep returned zero)
+   # Reviewer: <SE name>, <YYYY-MM-DD>
+   ```
+
+3. Add a single observable log/print at the start of the branch body so that the first time it fires in production, the team is alerted:
+
+   ```spy
+   log "UNTESTED BRANCH FIRING: <stage_name> / <branch_id> — review V1 parity before trusting output"
+   ```
+
+   The exact verb depends on which logging/observability book is installed in the target workspace; if none, fall back to a structured `the warning is "..."` binding the downstream pipeline can surface.
+
+4. The branch does NOT enter the iteration loop's parity-check rotation (there's no V1 trace to diff against). It DOES get a synthesized minimal-input smoke test fixture (per the next validation rule) so that the SPy compiles and runs through that path at least once on dev.
+
+**`sop_open_questions.md` entry required:** each accepted-risk branch must have an entry naming the SE who signed off, the customer contact who confirmed (if any), and the rationale. No silent acceptance.
+
+**Migration completion does NOT require accepted-risk branches to be exercised in production.** It does require them to be implemented and marked. Acceptance criterion: a customer-review pass on the V2 SOP lists every untested branch alongside the parity-confirmed ones, with the same level of detail.
 
 ### Terminal states
 

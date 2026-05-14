@@ -139,38 +139,49 @@ Before navigating to the editor for a stage, check whether the output already ex
 
 The same idempotency rule applies to the API fallback (Step 0.7) and user-paste fallback (Step 0.8): if a valid file already exists, those tiers don't re-run for that stage either. `_hydration.json` is always regenerated from current on-disk state — don't attempt to merge an old `_hydration.json` with new work.
 
-**The listener install, selection, copy, AND read MUST run in ONE synchronous `browser_evaluate` call.** Splitting across calls is unreliable (verified empirically — same code works in one call, returns empty when split across two). Pass the full block:
+**The listener install, selection, copy, AND read MUST run in ONE synchronous `browser_evaluate` call.** Splitting across calls is unreliable (verified empirically — same code works in one call, returns empty when split across two).
+
+**Listener-registration-order fix (verified 2026-05-14 on `to perform PO digitization`):** on a cold page, registering only a document-level bubble listener returns empty intermittently because *our* listener fires before Slate's own handler writes `clipboardData`. The fix is to first attach a no-op listener on the editor element itself; this shifts Slate's document-level handler to fire before ours.
+
+Pass the full block:
 
 ```js
 () => {
-  // 1) Install bubble-phase listener
-  //    Slate's own copy handler also runs in bubble phase and writes clipboardData.
-  //    Registration-order means our listener runs after Slate's and reads its data.
-  window.__captured = null;
+  let result = null;
+
+  // 1) Editor-level no-op listener.
+  //    Registers BEFORE the document-level listener below. This is what
+  //    forces Slate's doc-level copy handler to fire ahead of ours and
+  //    write to clipboardData. Without this no-op, doc-level read often
+  //    returns null on a cold page.
+  const ed = document.querySelector('#slate-editor');
+  ed.addEventListener('copy', () => { /* noop */ }, { capture: false });
+
+  // 2) Document-level bubble listener — fires AFTER Slate writes.
   document.addEventListener('copy', (e) => {
-    window.__captured = e.clipboardData.getData('text/plain');
+    result = e.clipboardData.getData('text/plain');
   }, { capture: false });
 
-  // 2) Select all editor content
-  const ed = document.querySelector('#slate-editor');
+  // 3) Select all editor content
   const range = document.createRange();
   range.selectNodeContents(ed);
   const sel = window.getSelection();
   sel.removeAllRanges();
   sel.addRange(range);
 
-  // 3) Trigger copy (synchronously fires listeners)
+  // 4) Trigger copy (synchronously fires listeners in registration order)
   document.execCommand('copy');
 
-  // 4) Return captured text in the same call
-  return window.__captured;
+  // 5) Return captured text in the same call
+  return result;
 }
 ```
 
 **Critical details:**
 
 - **Single synchronous block.** Two-call patterns (install listener in one eval, then copy in another) returned empty captures intermittently in testing. One call always worked.
-- **Bubble phase (`{ capture: false }`).** Capture phase reads empty because Slate writes to `clipboardData` in bubble phase. Verified via diagnostic listener: at capture phase `clipboardData.types = []`; at bubble phase `clipboardData.types = ["text/plain"]` with the full serialized KLang.
+- **Editor-level no-op THEN document-level reader.** The no-op is what makes registration order work — without it, on a fresh page our document-level reader runs before Slate's handler writes to `clipboardData` and we read empty.
+- **Bubble phase (`{ capture: false }`) on both.** Capture phase reads empty because Slate writes to `clipboardData` in bubble phase. Verified via diagnostic listener: at capture phase `clipboardData.types = []`; at bubble phase `clipboardData.types = ["text/plain"]` with the full serialized KLang.
 - **Slate calls `event.preventDefault()`** in its handler. That's fine — our listener still reads `clipboardData` regardless.
 
 **Sanity checks before saving:**
@@ -182,26 +193,51 @@ If any check fails: fall back to API (Step 0.7).
 
 Save to `<OUTPUT_BASE_DIR>/klang/stage0_<automation_slug>.txt`.
 
-#### Step 0.5 — Discover child procedures via static regex parse
+#### Step 0.5 — Discover child procedures (TWO PASSES — both required)
 
-Regex against the captured KLang text:
+Two patterns exist for invoking a sub-automation in KLang, and **the regex-only approach catches only one of them**. Verified 2026-05-14 on `to perform PO digitization`: the orchestrator's KLang had zero `run @{...}` references but did invoke two children (`convert a PO pdf to json`, `send a final output response`) via plain verb phrases. The regex returned empty and the agent missed both children. Both passes below are required.
+
+##### Pass 1 — Static `run @{...}` regex
+
+Some automations explicitly serialize sub-process invocations as:
+
+```
+run @{"type":"procedure","display":"<name>","value":"<id>"} with
+  ...
+```
+
+Run this regex against the captured KLang text:
 
 ```
 run @\{[^}]*"value":\s*"([a-z0-9]+)"
 ```
 
-Capture group 1 = child procedure ID. Dedupe. This finds every named published procedure the orchestrator can invoke, regardless of which runs hit it. No run data needed.
+Capture group 1 = child procedure ID. Dedupe.
 
-For each child ID:
+##### Pass 2 — Procedure-name match against the department registry
+
+The newer / more common form is a bare KLang verb phrase that the platform resolves to a department-local procedure at runtime. The UI flags these with a purple badge; the API does **not** expose them as `run @{...}` references in the captured KLang text.
+
+Procedure for this pass:
+
+1. Call `listProcedureGroupsByDepartmentv2(departmentId=<DEPT_ID>)` via Apollo Client (see "Authentication" section for why Apollo, not curl/fetch). Collect every procedure's `name` and `id`, dedupe, sort **longest-name-first** to handle overlapping prefixes (e.g. `send response` vs `send a final output response`).
+2. For each procedure name in the sorted list: scan the captured KLang text for occurrences. A line whose trimmed leading verb phrase matches a procedure name is a sub-process invocation of that procedure. Common forms to match:
+   - `<procedure name> with` (followed by parameter block)
+   - `<procedure name>` on its own line
+   - `<procedure name> as follows` (parameter block follows)
+3. Once matched, **don't re-match shorter procedure names against the same line** — longest-match-first wins. This is what handles the `send response` / `send a final output response` overlap.
+4. Collect the procedure IDs of all matches. Union with Pass 1's results → `child_procedure_ids_static`.
+
+##### For each discovered child ID (regardless of pass)
 
 1. Compute child's editor URL: `https://app.kognitos.com/department/<DEPT_ID>/processes/<CHILD_PROC_ID>?stage=PUBLISHED`.
 2. Navigate Playwright there. Session is reused — no second login.
 3. Wait for `#slate-editor`.
 4. Repeat Step 0.4's capture procedure.
 5. Save as `<OUTPUT_BASE_DIR>/klang/stage<N>_<child_slug>.txt` (`N` increments depth-first).
-6. Parse the child's KLang for nested `run @{...}` references; recurse.
+6. Apply BOTH passes to the child's captured KLang; recurse on any newly-discovered procedure IDs.
 
-Stop when the set of discovered procedure IDs stabilizes (no new IDs on the latest pass).
+Stop when the set of discovered procedure IDs stabilizes (no new IDs on the latest pass). Warn if recursion depth exceeds 5 — possible cycle or unexpectedly deep call graph.
 
 #### Step 0.6 — Forward-signal runtime-only blocks to Phase C
 
@@ -492,14 +528,31 @@ Cluster runs by fingerprint. For each branch in `branch_catalog.json`, list cand
 }
 ```
 
-Selection heuristics for `chosen`:
+Selection heuristics for `chosen` (now an array, not a single id):
 
 1. Prefer recent runs (KLang most likely matches current).
 2. Prefer `state=="done"` over errored runs (unless the branch IS the error path).
 3. Prefer runs whose `knowledgeId` matches the most recent run's `knowledgeId` (same KLang version).
-4. One representative is enough; for rare branches, pick two for safety.
+4. **Capture up to 5 representatives per branch path**, or `available` if fewer. Diversity across inputs matters: prefer 5 runs with distinct input shapes / vendors / file types over 5 runs that look identical. One run is not enough — within-branch input variance is invisible at N=1.
+5. If a branch has fewer than 2 candidates, flag it for Phase B.5 below before declaring `coverage_gaps`.
 
-`coverage_gaps` are flagged in `branch_catalog.md` for the user. Phase C does NOT block on gaps — the user decides whether to expand the sample window or formally accept the gap.
+`coverage_gaps` are flagged in `branch_catalog.md` for the user. Phase C does NOT block on gaps — the user decides whether to expand the sample window, perform a trigger-payload sweep (Phase B.5), or formally accept the gap.
+
+#### Step B.5 — Trigger-payload sweep for unobserved branches
+
+Before declaring a branch uncoverable, check whether the existing runs index contains an input that *would* exercise the branch but whose fingerprint didn't reach it for some other reason.
+
+Procedure (only run when at least one branch has 0 candidates from B.4):
+
+1. For each unobserved branch, identify the **predicate input** that gates it. Examples:
+   - `if the Attachments is found then` → trigger payload key `Attachments` presence
+   - `if the count equals 0 then` ... `else` → loop-iteration variable `count > 0` ⇒ `finalattachments.length > 1` ⇒ trigger payload key `Attachments` has array length > 1
+   - `if vendor is "Woolworths" then` → trigger payload key `vendor` value
+2. For each candidate run in `_orchestrator_runs_index.json`, fetch the trigger payload via `GetHistoricalFacts` against the relevant orchestrator input concept (e.g., the `the Attachments are …` line's concept id from the orchestrator's worker doc). Batch in groups of ~50 fact ids per call.
+3. Evaluate the predicate against each fetched payload. Any run whose payload would have driven the branch → add to that branch's `candidates` in `_branch_triage.json` and proceed to Phase C for it.
+4. If the sweep returns zero runs for a branch, that branch is **confirmed unobserved**. Annotate in `_branch_triage.json` under `coverage_gaps[].reason` with `"sweep complete; no payload matched predicate after checking all <N> indexed runs"`. The SE then decides: (a) ask the customer whether this branch ever runs in production, (b) treat as dead code, or (c) synthesize a test trigger.
+
+The sweep is cheap relative to Phase C captures: one Apollo Client call per ~50 fact ids, no UI clicks, no S3 downloads. Run it before bothering the SE.
 
 ### Phase C — Per-run deep capture
 
@@ -556,13 +609,34 @@ Walk every run folder; aggregate per-stage comparability + branches exercised in
 
 ## Authentication
 
-```
-POST https://api.app.kognitos.com/v2/app-production-k8s/graphql?op=<operationName>
-Authorization: <JWT>            ← literal token, NO "Bearer" prefix
-Content-Type: application/json
+**Run-data GraphQL ops require Apollo Client via `browser_evaluate` — direct curl/fetch returns 401 (verified 2026-05-14).**
+
+The Auth0 setup issues **two** ID tokens with different `aud` claims. The token visible in initial page-load network requests (e.g. `procedureGroup`, `UserClientData`) has `aud: ["https://app.kognitos.com/v2/", ...]`. The run-data ops (`listWorkersByProcedure`, `getSentenceExecutionData`, `getWorkerDocument`, `GetHistoricalFacts`) require a token with `aud: ["https://app.kognitos.com", ...]` — issued only when the View Runs page loads. Even with the correct JWT, browser `fetch()` returns 401 (likely a CORS / origin check). Using the page's built-in Apollo Client sidesteps both problems — auth is already wired in.
+
+**Required pattern for all run-data ops:**
+
+```js
+() => window.__APOLLO_CLIENT__.query({
+  fetchPolicy: 'network-only',
+  query: <AST>,
+  variables: { ... }
+}).then(r => r.data).catch(e => ({ error: String(e) }))
 ```
 
-JWT = the ID token Chrome's app sends; lifetime ~24h. On 401, stop and request a fresh JWT (or attempt self-fetch from the Playwright profile per "Browser/Login Constraints").
+`<AST>` is a parsed GraphQL document. Build it directly with the GraphQL AST kinds (no string parsing needed):
+
+```js
+const field = (name, args, sels) => ({ kind: 'Field', name: { kind: 'Name', value: name }, arguments: args || [], selectionSet: sels ? { kind: 'SelectionSet', selections: sels } : undefined });
+const arg   = (name, varName)    => ({ kind: 'Argument', name: { kind: 'Name', value: name }, value: { kind: 'Variable', name: { kind: 'Name', value: varName } } });
+const varDef = (name, type, required) => ({ kind: 'VariableDefinition', variable: { kind: 'Variable', name: { kind: 'Name', value: name } }, type: required ? { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: type } } } : { kind: 'NamedType', name: { kind: 'Name', value: type } } });
+const doc = (opName, vars, sels) => ({ kind: 'Document', definitions: [{ kind: 'OperationDefinition', operation: 'query', name: { kind: 'Name', value: opName }, variableDefinitions: vars, selectionSet: { kind: 'SelectionSet', selections: sels } }] });
+```
+
+To call `<op>` from inside Playwright: navigate to any authenticated app page first so the Apollo Client is initialized, then run the `browser_evaluate` block above.
+
+**Lifetime:** the Apollo Client persists for the page session. If `window.__APOLLO_CLIENT__` is undefined, the page hasn't fully booted — wait for `#slate-editor` (or any signed-in element) before querying.
+
+**No curl/fetch fallback for run-data ops.** The historical curl pattern documented in earlier versions of this spec is removed — it doesn't work against the production audiences. The only place curl is still used in Phase C is to GET signed S3 URLs that the UI hands us after a click (and even then, the URL came from a network capture, not from a GraphQL call).
 
 ## The three queries
 
@@ -812,17 +886,40 @@ Verified live against run `5hz4zlzur81hofr2dk5rivv10`'s `customerRecord` (`conce
 - `display_value` is `__large_value_7519` on EVERY appearance of the concept — including the line that produced it.
 - The producing line's own `answer.__concept__.display_value` is `"OK"` (a `RESULT`, not the actual JSON).
 - `answerOffloadedUrl` and `conceptsOffloadedUrl` are null on every entry.
-- `FactsAtLineId` (the editor's per-line refresh op) ALSO returns `__large_value_7519`. So FactsAtLineId is NOT the resolver.
-- Conclusion: the API does not return the actual large-value JSON via the documented ops we've found.
+- `FactsAtLineId` (the editor's per-line refresh op) was the resolver in older clients but is **broken in current production** — calls fail with schema errors (`Unknown argument 'workerId'`, `Field 'factsAtLineId' argument 'input' of type 'GetFactsAtLineIdInput!' is required`). Verified 2026-05-14. Do not call it.
+
+**Note:** `__large_value_*` shows up on **any** value type whose serialized size exceeds the inline limit — STRING, FILE, JSON. Earlier versions of this spec said "JSON only"; that's wrong.
 
 **Resolution order:**
 
 1. If `answerOffloadedUrl` or `conceptsOffloadedUrl` is non-null on the line, GET that URL with the same `Authorization: <JWT>` header. Save the JSON to `stage<N>_<lineId_first8>_<binding_name>.json` and replace `display_value` in the record with `<see file: stage<N>_<lineId_first8>_<binding_name>.json>`.
-2. Otherwise, plan a **UI badge click** in the batched UI pass. Click the `{ }` value badge for the concept on any line where it appears. The editor's popover hits an endpoint that returns the actual JSON — capture that response.
-3. **Cache by `concept_id`**: if the same `__large_value_NNNN` shows up on later lines (it usually does — the customerRecord is referenced 4+ times), point those records' `ui_capture_path` at the same file. One click per concept per run.
-4. If no downstream branch decision needs the value, **skip resolution** — `ui_capture_status: "skipped"` with `ui_capture_notes`.
+2. Otherwise, resolve via **`GetHistoricalFacts`** (Apollo Client `browser_evaluate`, see "Authentication"):
 
-> **TODO** (worth doing before next migration): identify the GraphQL op the value-badge popover hits and document it here. Eliminates the UI step entirely for `__large_value_*` resolution.
+   ```graphql
+   query GetHistoricalFacts($knowledgeId: ID!, $factIds: [HistoricalFactID!]!) {
+     getHistoricalFacts(knowledgeId: $knowledgeId, factIds: $factIds) {
+       id
+       names
+       type
+       value             # actual value (unescaped JSON string for STRING/JSON; S3 URI for FILE)
+       valueOffloadedUrl # non-null only for very large values; fall back to GET that URL if present
+     }
+   }
+   ```
+
+   Inputs:
+   - `knowledgeId` = `run.knowledgeId` from `ListWorkersByProcedure` (one per run).
+   - `factIds` = `[{ id: <concept_id>, epoch: <epoch> }, ...]`. Both come from a `getSentenceExecutionData` entry:
+     - `concept_id` = `JSON.parse(entry.answer).__concept__.id` (or any matching id from `entry.concepts`)
+     - `epoch` = `entry.epoch`
+
+   **Batch multiple concepts per call** — `factIds` is an array; the same `knowledgeId` covers everything in the run.
+
+3. **FILE type:** `GetHistoricalFacts` returns the raw `s3://...` URI in `value` — that is **not** a downloadable URL. To download the binary, still perform the UI click on `[data-cy="line-facts-FILE"]`: the editor's popover triggers a signed HTTPS URL via a network request which `browser_network_requests` captures, then `curl` it.
+
+4. **Cache by `concept_id`** within the same run: a single `GetHistoricalFacts` call can resolve every appearance of every `__large_value_*` for that run. No per-line work needed.
+
+5. If no downstream branch decision needs the value, **skip resolution** — record `value_capture_status: "skipped"` with notes. This decision is still recorded on the per-line trace record.
 
 ---
 
