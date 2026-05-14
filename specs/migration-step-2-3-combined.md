@@ -241,6 +241,16 @@ If gate fails:
 
 ## Phase B: SPy Authoring + Iteration
 
+### Prerequisites
+
+Phase B is **Nexus-only** — it does not require cluster-shell, direct DB access, or kubectl. All V2 interactions go through the Nexus MCP (`kognitos_create_automation`, `kognitos_manage_thread`, `kognitos_invoke_automation`, `kognitos_runs(get / list_events / get_run_outputs)`, `kognitos_inspect_exceptions(get / list_events / get_guide)`).
+
+**Required Nexus version:** the fixes from [kognitos/nexus#35](https://github.com/kognitos/nexus/pull/35) must be live in the cluster you're targeting (specifically: `list_events` pagination, `get_run_outputs` payload shape, and `inspect_exceptions(list_events)` ordering). Without those, the diff path and exception path return incomplete data and the iteration loop will appear to converge on a partial trace. Confirm your Nexus client/cluster is at or past that commit before starting Phase B.
+
+**Environment portability:** Phase B is designed to be run against any cluster the Nexus MCP can reach — dev, staging, prod, or a customer-org workspace. There is no V2-side spec dependency on the cluster being dev specifically. SE-driven iteration directly against a customer's production workspace is the intended end state once Nexus is healthy.
+
+(Phase A — SOP drafting — has no platform dependency at all; it reads only Phase 1 outputs on disk. SEs can complete Phase A offline today regardless of Nexus state.)
+
 Produce per stage (each stage gets its own SPy candidate):
 
 - `<OUTPUT_BASE_DIR>/spy_iterations/stage<N>/spy_candidate_v1.txt`
@@ -314,7 +324,7 @@ Goal: produce a structured diff comparing V2's execution to V1's captured trace.
 
 - V1 runs live on the legacy `app.kognitos.com` tenant. Nexus does NOT reach that tenant. V1 data is what Phase 1 captured via GraphQL `getSentenceExecutionData` and saved to `stage<N>_branch_trace.json`.
 - V2 runs live on the dev cluster. Nexus DOES reach the dev cluster. V2 data must be fetched via Nexus — there is no GraphQL fallback for V2.
-- V1 and V2 lineIds DO NOT MATCH. V2 SPy is a rewritten automation; its KLang hashes are new. **Do NOT try to align V1 and V2 by lineId.** Align by **predicate text + binding name + structural position** (which branch in the SOP each predicate belongs to).
+- **V2 has no KLang and no lineIds.** V2 is SPy + a generated SOP; the runtime emits Nexus events keyed by SPy statement, not by KLang sentence. V1's lineId space (the `v2_<klang_hash>_<line_hash>_<idx>` ids from `getSentenceExecutionData`) does not exist on the V2 side at all. **There is no shared identifier between a V1 sentence and a V2 SPy statement.** Align V1 and V2 only by semantic anchors: **predicate text + binding name + SOP branch label** (which branch in the SOP each predicate belongs to).
 
 Inputs:
 - V1 reference: `run_captures/<folder>/stage<N>_branch_trace.json` + recorded handoff payload values in `run_capture.json`.
@@ -326,7 +336,7 @@ Procedure:
    - `kognitos_runs(get, run_id=<v2_run_id>)` — run metadata + final status.
    - `kognitos_runs(list_events, run_id=<v2_run_id>)` — event-by-event execution log. This is the source-of-truth for what V2 did, the analog of V1's `getSentenceExecutionData`.
    - `kognitos_runs(get_run_outputs, run_id=<v2_run_id>)` — final output bindings, including the handoff payload at the boundary.
-2. **Normalize V1 and V2 onto a shared comparison schema.** Because lineIds don't match, the comparison key is (predicate text OR binding name OR SOP branch label), not lineId. Recommended in-memory shape for each side:
+2. **Normalize V1 and V2 onto a shared comparison schema.** V2 has no lineId-equivalent at all, so the comparison key is (predicate text OR binding name OR SOP branch label). Recommended in-memory shape for each side:
 
    ```json
    {
@@ -409,8 +419,7 @@ Procedure:
      "exception": {
        "id": "<exception_id>",
        "text": "...",
-       "line": "...",
-       "lineId": "v2_…"
+       "line": "..."
      },
      "resolution_thread": [
        { "author": "resolution_agent", "text": "..." }
@@ -478,13 +487,93 @@ No new design decisions. If you discover the plan is incomplete, stop and ask.
 - Every Quill interaction in this phase uses Pattern 1 (plan first, then implement). No exceptions.
 - Fix-context attached to a Quill fix prompt comes from real run evidence — the diff JSON or the exception bundle. Never from the orchestrator's hypothesis about what *might* have gone wrong.
 
-### Capping iterations
+### Terminal states
 
-If a (stage, branch) hits **3 iterations without convergence** (diff still non-empty or exception still firing), stop the loop, write the latest diff/exception bundle to `iteration_results.md` with `status: blocked`, and surface to the user. Likely causes worth checking before continuing:
+The iteration loop exits in exactly one of these states for each (stage, branch). The agent **classifies the exit** and writes `<OUTPUT_BASE_DIR>/migration_outcome.json` (schema below) before returning to the SE. No third option, no ambiguous "we got tired" exit.
 
-- The reference run is `near-current` with an undocumented divergence (revisit `stages_comparability_reasons`).
-- The branch was never actually parity-eligible (downgrade to `accepted-risk` with sign-off).
-- Quill is stuck in a local minimum (rotate the fix prompt — try framing the divergence differently).
+| Outcome | Trigger | What it means |
+|---|---|---|
+| `parity_reached` | Empty trace diff (after `near-current` tolerance) AND empty handoff-payload diff for every parity-quality branch in this stage | Stage is migration-complete. Proceed to SOP cleanup pass, then next stage. |
+| `book_missing_procedure` | Quill's plan requires a verb/binding whose signature is not satisfied by any installed book in the target workspace | SE installs / authorizes the missing book OR escalates to platform. Migration paused for this branch. |
+| `book_broken_procedure` | Same book-proc invocation fails the same way across **2 iterations** with no SPy change to that line; OR the proc's output deviates from its documented contract; OR throws an exception unrelated to its inputs | Not a SPy bug. File platform/book ticket with the evidence pointers; pause migration for this branch. |
+| `spy_pattern_limitation` | After **5 iterations** on the same branch with diff shape *changing* but not *shrinking* (Quill is shuffling, not fixing) | Quill cannot express the required logic. Escalate to Quill team with minimal repro from `evidence`. |
+| `v1_data_insufficient` | A branch executes that has no `current` or `near-current` capture in `_capture_index.json`, OR a parity-quality capture is found mid-loop to be insufficient (e.g. missing handoff field) | Return to Step 1 and capture more representative runs. Don't fabricate the trace. |
+| `sop_ambiguity_unresolvable` | A branch requires a customer-input business decision (classification keywords, dead-end routing) and `sop_open_questions.md` has not been resolved by the SE | SE collects answer from customer; agent resumes. |
+| `platform_bug` | Nexus or runtime returns a non-deterministic 5xx / unknown internal error not attributable to the SPy or any book contract | File platform ticket. Pause migration. |
+
+### Classification rules in the loop
+
+1. **After each iteration**, the agent attempts to classify the latest failure into one of the non-`parity_reached` categories. If it cannot classify (insufficient evidence), it runs **one additional diagnostic iteration** (e.g. a smaller-scope re-invoke, or a Nexus exception re-fetch) — then **must** force a classification. No third "I'm not sure" turn.
+2. `book_broken_procedure` is sticky: once the same proc fails identically twice with no SPy delta on the failing line, classify and exit. Do not let Quill rewrite the line — it's not the problem.
+3. `spy_pattern_limitation` requires explicit evidence that the diff is *moving but not shrinking*. If the diff is shrinking across iterations, keep iterating (this is a slow-converging fix, not a limitation).
+4. `v1_data_insufficient` is normally caught by Phase A's gate. If it surfaces during Phase B, treat it as a Phase A failure and return.
+5. `platform_bug` is the catch-all for "Nexus said something I cannot interpret." Do not loop on platform errors — one occurrence is enough to classify.
+6. **Cross-branch implication.** If one branch terminates in `book_missing_procedure` / `book_broken_procedure` / `platform_bug`, continue iterating the other branches in this stage anyway — each branch terminates independently. Aggregate outcomes into `migration_outcome.json` at the end.
+
+### `migration_outcome.json` schema
+
+Written to `<OUTPUT_BASE_DIR>/migration_outcome.json` at the end of Phase B, regardless of outcome:
+
+```json
+{
+  "automation": "<AUTOMATION_NAME>",
+  "stages": [
+    {
+      "stage": 1,
+      "branches": [
+        {
+          "branch": "B5a",
+          "outcome": "book_missing_procedure",
+          "iterations_completed": 4,
+          "final_spy_path": "spy_iterations/stage1/spy_candidate_v4.txt",
+          "evidence": {
+            "v2_run_ids": ["run_abc...", "run_def..."],
+            "quill_threads": ["thread_xyz..."],
+            "exception_ids": ["exc_..."],
+            "iteration_diffs": [
+              "spy_iterations/stage1/iteration_1_diff.json",
+              "spy_iterations/stage1/iteration_2_diff.json"
+            ]
+          },
+          "blocker": {
+            "category": "book_missing_procedure",
+            "summary": "Quill plan requires `extract tables from <pdf>` but no installed book exposes a procedure matching that signature",
+            "verb_signature": "extract tables from <pdf>",
+            "books_checked": ["pdf_v3", "idp_v2"],
+            "suggested_fix": "Install or extend a book that exposes table extraction from PDF"
+          }
+        },
+        {
+          "branch": "B5b",
+          "outcome": "parity_reached",
+          "iterations_completed": 2,
+          "final_spy_path": "spy_iterations/stage1/spy_candidate_v6.txt"
+        }
+      ]
+    }
+  ],
+  "overall_status": "blocked",
+  "blocker_summary": [
+    "stage 1 / B5a: book_missing_procedure (table extraction)",
+    "stage 2 / B11: spy_pattern_limitation (nested conditional + loop scope)"
+  ]
+}
+```
+
+`overall_status` is `parity_reached` iff every branch is `parity_reached`. Otherwise `blocked`, and `blocker_summary` lists the structured blockers the SE needs to act on.
+
+### Blocker payload — required fields per category
+
+Each `blocker` object must include `category` + `summary`, plus the fields below:
+
+- **`book_missing_procedure`** — `verb_signature` (the KLang-style call Quill tried to make), `books_checked` (which installed books were verified), `suggested_fix`.
+- **`book_broken_procedure`** — `book_name`, `procedure_signature`, `expected_behavior` (from book docs), `observed_behavior`, `reproducer_run_id`.
+- **`spy_pattern_limitation`** — `iterations_with_diff_shape` (list of how the diff changed across N iterations), `quill_thread_ids`, `minimal_repro_input_path`.
+- **`v1_data_insufficient`** — `branch_with_no_capture`, `predicate_text`, `required_capture_quality` (`current` or `near-current`).
+- **`sop_ambiguity_unresolvable`** — `open_question_ref` (which line of `sop_open_questions.md`), `customer_decision_required`.
+- **`platform_bug`** — `nexus_tool` (which MCP call), `error_payload`, `run_id_or_context`, `reproducible` (boolean).
+
+The point of these required fields is that an SE reading `migration_outcome.json` can act without re-running anything: install the book, file the ticket, ask the customer the question, or capture more V1 data. No "go re-read the spy_iterations folder" hunt.
 
 ## Safety Rules
 
@@ -500,4 +589,4 @@ Combined execution is complete when:
 2. SPy candidates per stage pass parity checks (strict or tolerant) for every `parity`/`parity-tolerant` branch.
 3. Handoff payload checks pass for required fields at `<DOWNSTREAM_BOUNDARY_NAME>`.
 4. `accepted-risk` branches have a synthesized smoke test that produces a self-consistent end-state.
-5. Remaining blockers (if any) are documented in `open_gaps.md` with an explicit "Phase 1 backfill needed" or "stakeholder sign-off needed" classification.
+5. **`migration_outcome.json` is written** with `overall_status: parity_reached` (success) OR `overall_status: blocked` with every blocked branch carrying a fully-populated structured `blocker` object per the schema above. There is no "partial success without classification" outcome.

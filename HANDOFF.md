@@ -120,7 +120,7 @@ Added to `specs/migration-step-2-3-combined.md`:
 **Critical asymmetry documented:**
 - V1 runs = legacy `app.kognitos.com` tenant. Nexus can't reach. Phase 1 captures via GraphQL `getSentenceExecutionData`.
 - V2 runs = dev cluster. Reachable ONLY via Nexus. No GraphQL fallback for V2.
-- V1 and V2 lineIds DO NOT MATCH (rewritten SPy → new KLang hashes). Diff aligns by **predicate text + binding name + SOP branch label**, never by lineId.
+- V2 has no KLang and no lineIds — it's SPy + generated SOP, and Nexus events are keyed by SPy statement, not KLang sentence. V1's lineId space (`v2_<klang_hash>_<line_hash>_<idx>` from `getSentenceExecutionData`) has no counterpart on V2. There is no shared identifier between a V1 sentence and a V2 SPy statement; the diff aligns only by **predicate text + binding name + SOP branch label**.
 
 **Iteration cap:** 3 turns without convergence → mark `blocked`, surface to user.
 
@@ -334,7 +334,7 @@ Outputs:
 Procedure (already documented in the spec):
 1. Load V1 trace from disk.
 2. Fetch V2 events via Nexus `kognitos_runs(list_events, run_id)`.
-3. Normalize both to: `{branch_decisions, named_bindings, child_invocations}` keyed by predicate text / binding name / SOP branch label (NOT lineId — they differ between V1 and V2).
+3. Normalize both to: `{branch_decisions, named_bindings, child_invocations}` keyed by predicate text / binding name / SOP branch label. (V2 has no lineId-equivalent at all — it's SPy, not KLang — so there's no shared ID to join on; semantic anchors are the only option.)
 4. Compute mismatches + extras + missing.
 5. Apply `near-current` tolerance filtering from `stages_comparability_reasons`.
 6. Compute handoff payload diff via `kognitos_runs(get_run_outputs)`.
@@ -374,7 +374,7 @@ In order of pain:
 
 2. **Two-call vs single-call browser_evaluate.** Even with bubble phase, splitting listener-install and copy-trigger across two `browser_evaluate` calls returned empty intermittently. Always put the full pattern in one synchronous block.
 
-3. **V2 lineIds ≠ V1 lineIds.** I initially wrote the diff path to align by lineId. The user corrected: V2 SPy is a rewritten automation with new KLang hashes, so lineIds don't match. Diff has to align by **predicate text + binding name + SOP branch label**. Fixed in commit `002dd9a`.
+3. **V2 has no KLang and no lineIds.** I initially wrote the diff path to align by lineId, and even after a first correction left the muddled phrasing "V2 SPy is a rewritten automation with new KLang hashes" — which is wrong: V2 has no KLang at all. The accurate statement: V2 is SPy + generated SOP; Nexus events key off SPy statements, not KLang sentences; V1's `v2_<klang_hash>_<line_hash>_<idx>` lineId space has no counterpart on V2. Align V1↔V2 only by semantic anchors (**predicate text + binding name + SOP branch label**). Spec + handoff cleaned up after this re-correction.
 
 4. **Nexus can't reach the V1 tenant.** V1 lives on `app.kognitos.com` (legacy). Nexus targets the dev cluster. V1 data is always GraphQL-fetched (already what Phase 1 does); V2 data is always Nexus-fetched.
 
