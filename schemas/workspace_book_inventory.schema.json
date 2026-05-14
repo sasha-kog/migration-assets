@@ -29,7 +29,7 @@
           "properties": {
             "stage_name": { "type": "string", "minLength": 1 },
             "automation_id": { "type": "string", "minLength": 1 },
-            "language": { "type": "string", "enum": ["klang", "spy"] },
+            "language": { "type": "string", "enum": ["klang", "python"] },
             "source_path": { "type": "string" },
             "book_requirements": {
               "type": "array",

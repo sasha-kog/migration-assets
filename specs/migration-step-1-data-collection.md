@@ -124,10 +124,10 @@ Capture `document.title` — format is `"<automation name> | <department name> |
 
 Before navigating to the editor for a stage, check whether the output already exists from a prior partial run:
 
-1. Compute the target path: `<OUTPUT_BASE_DIR>/klang/stage<N>_<slug>.txt` for KLang procedures or `<OUTPUT_BASE_DIR>/spy/stage<N>_<slug>.py` for SPy procedures (`<N>` = stage number, `<slug>` = slugified procedure name).
+1. Compute the target path: `<OUTPUT_BASE_DIR>/klang/stage<N>_<slug>.txt` for KLang procedures or `<OUTPUT_BASE_DIR>/python/stage<N>_<slug>.py` for Python procedures (`<N>` = stage number, `<slug>` = slugified procedure name).
 2. If the file exists, read it and run the **same sanity check** the spec applies after a fresh capture (see "Sanity checks before saving" further down):
    - length > 100 chars,
-   - for KLang: contains `the ` or `if ` (KLang language signals); for SPy: contains `@procedure` or `def ` (Python signals),
+   - for KLang: contains `the ` or `if ` (KLang language signals); for Python: contains `@procedure` or `def ` (Python signals),
    - no abrupt mid-token truncation.
 3. If the sanity check passes:
    - **SKIP** the navigate + copy-capture work for this stage.
@@ -195,7 +195,7 @@ Save to `<OUTPUT_BASE_DIR>/klang/stage0_<automation_slug>.txt`.
 
 #### Step 0.5 — Discover child procedures (TWO PASSES + editor classification — all required)
 
-Two patterns exist for invoking a child procedure, and **the regex-only approach catches only one of them**. Additionally, child procedures can be authored in KLang (Slate editor) OR SPy (Python via CodeMirror editor). These need different treatment. Verified 2026-05-14 on `to perform PO digitization`: the orchestrator's KLang had zero `run @{...}` references but did invoke five children — two KLang and three SPy/Python. The original regex returned empty; even after adding Pass 2, treating every match as a KLang child stage caused SPy source to be captured into `klang/` and to be subjected to Phase A/B/C treatment that doesn't apply to Python code. Both passes plus the editor classification below are required.
+Two patterns exist for invoking a child procedure, and **the regex-only approach catches only one of them**. Additionally, child procedures can be authored in KLang (Slate editor) OR Python (CodeMirror editor, with the `@procedure` decorator). These need different treatment. Verified 2026-05-14 on `to perform PO digitization`: the orchestrator's KLang had zero `run @{...}` references but did invoke five children — two KLang and three Python. The original regex returned empty; even after adding Pass 2, treating every match as a KLang child stage caused Python source to be captured into `klang/` and to be subjected to Phase A/B/C treatment that doesn't apply to Python code. Both passes plus the editor classification below are required.
 
 ##### Pass 1 — Static `run @{...}` regex
 
@@ -234,28 +234,28 @@ Procedure for this pass:
 2. Navigate Playwright there. Session is reused — no second login.
 3. **Detect editor type before capturing:**
    - If `#slate-editor` is present → KLang procedure.
-   - Else if a CodeMirror element is present (`.cm-editor`, `.cm-content`, or similar) → SPy/Python procedure.
+   - Else if a CodeMirror element is present (`.cm-editor`, `.cm-content`, or similar) → Python procedure.
    - Else → unrecognized authoring surface. Warn and skip; record in `_hydration.json` under `warnings`.
 4. **Capture according to type:**
    - **KLang:** repeat Step 0.4's copy-capture procedure. Save as `<OUTPUT_BASE_DIR>/klang/stage<N>_<child_slug>.txt`. Set `language: "klang"`, `source_path` to that file.
-   - **SPy:** read the CodeMirror content via `browser_evaluate` (`document.querySelector('.cm-content').innerText` or equivalent). Save as `<OUTPUT_BASE_DIR>/spy/stage<N>_<child_slug>.py`. Set `language: "spy"`, `source_path` to that file. Do NOT save SPy to `klang/`.
+   - **Python:** read the CodeMirror content via `browser_evaluate` (`document.querySelector('.cm-content').innerText` or equivalent). Save as `<OUTPUT_BASE_DIR>/python/stage<N>_<child_slug>.py`. Set `language: "python"`, `source_path` to that file. Do NOT save Python to `klang/`.
 5. **Recursion rule depends on language:**
    - **KLang stages:** apply BOTH discovery passes (regex + procedure-name match) to the captured KLang text; recurse on any newly-discovered procedure IDs.
-   - **SPy stages:** treat as opaque source. Do NOT scan the Python for procedure-name matches against the department registry (Python imports and function calls are not the same as KLang verbs). Do NOT recurse from SPy stages.
+   - **Python stages:** treat as opaque source. Do NOT scan the Python for procedure-name matches against the department registry (Python imports and function calls are not the same as KLang verbs). Do NOT recurse from Python stages.
 6. `N` increments depth-first across both types.
 
 Stop when the set of discovered procedure IDs stabilizes (no new IDs on the latest pass). Warn if recursion depth exceeds 5 — possible cycle or unexpectedly deep call graph.
 
-##### How KLang and SPy stages diverge downstream
+##### How KLang and Python stages diverge downstream
 
-| Aspect | KLang stage | SPy stage |
+| Aspect | KLang stage | Python stage |
 |---|---|---|
-| Source location | `klang/stage<N>_<slug>.txt` | `spy/stage<N>_<slug>.py` |
-| `_hydration.json` `language` field | `"klang"` | `"spy"` |
-| Phase A (branch catalog) | Required | **Skipped.** SPy procedures are treated as opaque code; their internal branches are not enumerated. |
-| Phase B (run discovery) | Required if procedure has independent runs | Optional. SPy procedures rarely have independent runs — their I/O is observable at the parent's call site in the parent's `stage<M>_branch_trace.json`. |
-| Phase C (per-run deep capture) | Required when chosen runs exist | **Skipped at the SPy stage level.** The SPy procedure's I/O for any given run is already in the parent KLang stage's trace at the line where SPy is invoked. |
-| Step 2-3 migration treatment | Quill writes V2 SPy from the V1 KLang | The V1 SPy source is preserved verbatim into V2 (or a book substitute is chosen, per the workspace book-inventory preflight). |
+| Source location | `klang/stage<N>_<slug>.txt` | `python/stage<N>_<slug>.py` |
+| `_hydration.json` `language` field | `"klang"` | `"python"` |
+| Phase A (branch catalog) | Required | **Skipped.** Python procedures are treated as opaque code; their internal branches are not enumerated. |
+| Phase B (run discovery) | Required if procedure has independent runs | Optional. Python procedures rarely have independent runs — their I/O is observable at the parent's call site in the parent's `stage<M>_branch_trace.json`. |
+| Phase C (per-run deep capture) | Required when chosen runs exist | **Skipped at the Python stage level.** The Python procedure's I/O for any given run is already in the parent KLang stage's trace at the line where the Python procedure is invoked. |
+| Step 2-3 migration treatment | Quill writes V2 SPy from the V1 KLang | The V1 Python source is preserved verbatim into V2 (or a book substitute is chosen, per the workspace book-inventory preflight). |
 
 #### Step 0.6 — Forward-signal runtime-only blocks to Phase C
 
@@ -389,9 +389,9 @@ A full Phase 0 walk on this orchestrator produced (in this order):
 
 Total time: <30 seconds after SSO login. Zero human interaction post-login.
 
-### Phase A — Branch enumeration (KLang stages only — SPy stages skipped)
+### Phase A — Branch enumeration (KLang stages only — Python stages skipped)
 
-**SPy stages are excluded from Phase A.** Their Python source is captured in Step 0.5 and treated as opaque — internal `if/else` in Python is not enumerated as a branch matrix. The branch catalog covers only stages where `language == "klang"` in `_hydration.json`.
+**Python stages are excluded from Phase A.** Their Python source is captured in Step 0.5 and treated as opaque — internal `if/else` in Python is not enumerated as a branch matrix. The branch catalog covers only stages where `language == "klang"` in `_hydration.json`.
 
 
 
@@ -423,7 +423,7 @@ Write `branch_catalog.md` (human-readable) and `branch_catalog.json` (machine-re
 
 ### Phase B — Run discovery & branch-coverage triage (API-first, parallel)
 
-**Stages in scope:** only stages where `language == "klang"` AND the procedure has independent runs. Phase B is skipped for SPy stages and for KLang stages that have zero independent runs (e.g., child KLang procedures only invoked as sub-documents — their per-run data is observable in the parent's `stage<M>_branch_trace.json` and there is nothing to list via `ListWorkersByProcedure`).
+**Stages in scope:** only stages where `language == "klang"` AND the procedure has independent runs. Phase B is skipped for Python stages and for KLang stages that have zero independent runs (e.g., child KLang procedures only invoked as sub-documents — their per-run data is observable in the parent's `stage<M>_branch_trace.json` and there is nothing to list via `ListWorkersByProcedure`).
 
 **What this phase does:** Find up to 5 representative production runs per major branch (per Step B.4), so Phase C only does expensive deep captures on the runs that matter, not all ~100-200 recent runs in the sample window.
 
@@ -580,6 +580,20 @@ Procedure (only run when at least one branch has 0 candidates from B.4):
 4. If the sweep returns zero runs for a branch, that branch is **confirmed unobserved**. Annotate in `_branch_triage.json` under `coverage_gaps[].reason` with `"sweep complete; no payload matched predicate after checking all <N> indexed runs"`. The SE then decides: (a) ask the customer whether this branch ever runs in production, (b) treat as dead code, or (c) synthesize a test trigger.
 
 The sweep is cheap relative to Phase C captures: one Apollo Client call per ~50 fact ids, no UI clicks, no S3 downloads. Run it before bothering the SE.
+
+#### Step B.6 — Sub-document branch sweep (for child KLang stages with their own branch matrix)
+
+KLang sub-automations (stages where `language == "klang"` and the procedure has zero independent runs — i.e., only invoked as sub-documents of an orchestrator) have their own branches but cannot be triaged via `ListWorkersByProcedure` (returns 0). Their branch coverage is determined by which **orchestrator** runs exercised which child-stage branches. Without a sweep, the child stage shows only the branches exercised in the chosen orchestrator reps — which can hide major coverage gaps (e.g. for `to perform PO digitization`, stage 3 has 17 branches catalogued but only 1 was exercised in the first captured orchestrator run).
+
+Procedure:
+
+1. For each child KLang stage `<N>` (`language == "klang"` and no independent runs), find its `documentToken` by inspecting the orchestrator's trace at the line where it's invoked (`subDocuments[i].documentToken`).
+2. For each orchestrator run in `_orchestrator_runs_index.json`, call `getSentenceExecutionData(workerId=<run_id>, documentToken=<child_token>, token=null)` via Apollo Client.
+3. For each branch in `branch_catalog.json[stages][<N>][branches]`, locate the predicate's `lineId` in the worker doc and check the corresponding exec entry's `display_value` (`"Condition Met"` / `"Condition Not Met"` / null).
+4. Record per (run, child stage, branch) → did this branch fire? Aggregate into `_branch_triage.json` under `stages[<N>][<branch>].candidates` — each candidate is a `(orchestrator_run_id, child_document_token)` pair.
+5. The Phase C selection rule (up to 5 reps per branch path, prefer input diversity) applies to these sub-document branches the same way it applies to orchestrator branches. The "rep" is an orchestrator run; deep-capturing that run automatically deep-captures the child stage.
+
+This sweep is the only path to determining child-stage branch coverage. Skipping it leaves child-stage branches that *were* exercised in some orchestrator run looking like coverage gaps. Run it before declaring child-stage `coverage_gaps`.
 
 ### Phase C — Per-run deep capture
 

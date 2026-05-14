@@ -69,16 +69,16 @@
           "name": { "type": "string", "minLength": 1 },
           "language": {
             "type": "string",
-            "enum": ["klang", "spy"],
+            "enum": ["klang", "python"],
             "description": "Authoring language of the procedure. 'klang' = Slate editor, has branches, gets full Phase A/B/C treatment. 'spy' = CodeMirror Python editor, treated as opaque source; I/O captured at parent's call site, no per-line trace, no separate branch matrix."
           },
           "source_path": {
             "type": "string",
-            "description": "Path to the captured source. KLang procedures: 'klang/stage<N>_<slug>.txt'. SPy procedures: 'spy/stage<N>_<slug>.py'."
+            "description": "Path to the captured source. KLang procedures: 'klang/stage<N>_<slug>.txt'. Python procedures: 'python/stage<N>_<slug>.py'."
           },
           "source_capture_method": { "type": "string", "enum": ["copy_capture", "api_render", "user_paste", "cached"] },
           "source_capture_run_id": { "type": ["string", "null"] },
-          "klang_hash": { "type": ["string", "null"], "description": "Only meaningful when language == 'klang'. Null for SPy stages." },
+          "klang_hash": { "type": ["string", "null"], "description": "Only meaningful when language == 'klang'. Null for Python stages." },
           "procedure_version_at_fetch": { "type": ["string", "null"] },
           "child_procedure_ids_static": { "type": "array", "items": { "type": "string" } },
           "discovered_via": { "type": "string", "enum": ["url", "klang_static_parse_from_stage_0", "klang_static_parse"] }
