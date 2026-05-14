@@ -1,0 +1,151 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kognitos.example/schemas/workspace_book_inventory.schema.json",
+  "title": "workspace_book_inventory.json",
+  "description": "Phase B Preflight output. Produced before the SPy iteration loop begins. Lists every book required by the captured V1 KLang (per stage), whether the target workspace has it installed, and whether installed books expose a procedure that matches the intent. Lines that do not require a book (control flow, arithmetic, string ops) are omitted.",
+  "type": "object",
+  "required": ["generated_at", "target_workspace", "stages", "overall_status"],
+  "additionalProperties": false,
+  "properties": {
+    "generated_at": { "type": "string", "format": "date-time" },
+    "target_workspace": {
+      "type": "object",
+      "required": ["organization_id", "workspace_id"],
+      "additionalProperties": true,
+      "properties": {
+        "organization_id": { "type": "string", "minLength": 1 },
+        "workspace_id": { "type": "string", "minLength": 1 },
+        "workspace_label": { "type": "string" }
+      }
+    },
+    "stages": {
+      "type": "object",
+      "description": "Keyed by stage_number (string). One entry per stage in <STAGES> (orchestrator + each sub-automation).",
+      "patternProperties": {
+        "^[0-9]+$": {
+          "type": "object",
+          "required": ["stage_name", "automation_id", "book_requirements"],
+          "additionalProperties": false,
+          "properties": {
+            "stage_name": { "type": "string", "minLength": 1 },
+            "automation_id": { "type": "string", "minLength": 1 },
+            "klang_path": { "type": "string" },
+            "book_requirements": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/book_requirement" }
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "overall_status": {
+      "type": "string",
+      "enum": ["satisfied", "needs_confirmation", "blocked"],
+      "description": "satisfied: every requirement resolved to an installed book with a matched procedure. needs_confirmation: at least one requirement is soft-surfaced for SE confirmation, no hard blocks. blocked: at least one required book is not installed in the workspace."
+    },
+    "blockers": {
+      "type": "array",
+      "description": "Populated when overall_status == 'blocked'. Each entry corresponds to a book_requirement whose resolution is 'missing'.",
+      "items": {
+        "type": "object",
+        "required": ["stage", "intent_description", "candidate_books", "evidence_lines"],
+        "additionalProperties": true,
+        "properties": {
+          "stage": { "type": "string" },
+          "intent_description": { "type": "string" },
+          "candidate_books": { "type": "array", "items": { "type": "string" } },
+          "evidence_lines": { "type": "array", "items": { "type": "integer", "minimum": 1 } },
+          "suggested_fix": { "type": "string" }
+        }
+      }
+    },
+    "pending_confirmations": {
+      "type": "array",
+      "description": "Populated when overall_status == 'needs_confirmation'. Batched questions for the SE; the agent waits for one combined response before continuing.",
+      "items": {
+        "type": "object",
+        "required": ["stage", "intent_description", "candidate_books", "question"],
+        "additionalProperties": true,
+        "properties": {
+          "stage": { "type": "string" },
+          "intent_description": { "type": "string" },
+          "candidate_books": { "type": "array", "items": { "type": "string" } },
+          "evidence_lines": { "type": "array", "items": { "type": "integer", "minimum": 1 } },
+          "question": { "type": "string", "description": "Verbatim text shown to the SE." }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "book_requirement": {
+      "type": "object",
+      "required": ["intent_description", "candidate_books", "evidence_lines", "resolution"],
+      "additionalProperties": false,
+      "properties": {
+        "intent_description": {
+          "type": "string",
+          "description": "Short description of what the KLang line needs (e.g. 'extract structured fields from PDF', 'discover customer from NetSuite')."
+        },
+        "intent_category": {
+          "type": "string",
+          "enum": [
+            "explicit_book_clause",
+            "document_capability",
+            "ui_capability",
+            "saas_capability",
+            "llm_only",
+            "other"
+          ],
+          "description": "Classification from books.md. 'other' for anomalies the agent could not categorize confidently."
+        },
+        "evidence_lines": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 1 },
+          "minItems": 1,
+          "description": "Line numbers in this stage's klang/stage<N>_<slug>.txt that motivate this requirement."
+        },
+        "candidate_books": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "description": "Candidate book names from books.md. Length 1 for explicit cases (e.g. 'from netsuite'); >1 when ambiguous (e.g. Excel vs Microsoft Excel) or when the choice between LLM book vs inline SPy applies."
+        },
+        "installed_books": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Subset of candidate_books that are installed in the target workspace per kognitos_books(list)."
+        },
+        "matched_procedures": {
+          "type": "array",
+          "description": "Procedures returned by kognitos_books(search_procedures, book=<X>, query=<intent_description>) that the agent believes satisfy the intent.",
+          "items": {
+            "type": "object",
+            "required": ["book", "procedure_signature"],
+            "additionalProperties": true,
+            "properties": {
+              "book": { "type": "string" },
+              "procedure_signature": { "type": "string" },
+              "rank": { "type": "number" }
+            }
+          }
+        },
+        "resolution": {
+          "type": "string",
+          "enum": ["satisfied", "needs_confirmation", "missing"],
+          "description": "satisfied: installed book exposes a high-confidence procedure match. needs_confirmation: installed book exposes weak/ambiguous matches OR multiple candidate books are plausible. missing: no candidate book is installed in the workspace."
+        },
+        "confirmation_question": {
+          "type": "string",
+          "description": "Required iff resolution == 'needs_confirmation'. Verbatim text the agent surfaces to the SE."
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "resolution": { "const": "needs_confirmation" } } },
+          "then": { "required": ["confirmation_question"] }
+        }
+      ]
+    }
+  }
+}

@@ -251,6 +251,55 @@ Phase B is **Nexus-only** — it does not require cluster-shell, direct DB acces
 
 (Phase A — SOP drafting — has no platform dependency at all; it reads only Phase 1 outputs on disk. SEs can complete Phase A offline today regardless of Nexus state.)
 
+### Phase B Preflight — Book Capability Check
+
+Before iteration #1, verify the target workspace has the books and procedures the captured V1 KLang implies. Hard-block when a required book is not installed; soft-surface (batched, one round of SE confirmation) when an installed book is present but procedure coverage is ambiguous. Lines that do not need a book — pure control flow, arithmetic, string operations — are excluded from the inventory entirely.
+
+Reference for KLang → candidate-book classification: `books.md` (digest of the 64 installed integrations, with KLang-pattern → candidate-book mappings).
+
+#### Procedure
+
+Per stage in the `<STAGES>` table:
+
+1. **Walk the stage's KLang** at `klang/stage<N>_<slug>.txt` line by line. Skip lines that are clearly book-free (`if … then`, loops, comparisons, arithmetic, string assignment, control flow).
+2. **For each non-skipped line, classify the intent** using `books.md`:
+   - `explicit_book_clause` — `from <book>`, `in <book>`, `to <book>`. The book name is verbatim in the KLang.
+   - `document_capability` — extract/classify/analyze/read/split/merge over a document. Default candidate: **IDP**.
+   - `ui_capability` — visible browser interaction. Candidates: **Browser**, **Browser Use**.
+   - `saas_capability` — named-service verb whose book is unambiguous (e.g. NetSuite, Gmail).
+   - `llm_only` — free-form Koncierge over plain values, no document. Candidates: **Anthropic / OpenAI / Gemini** OR pure SPy with inline Koncierge. Do not pick.
+3. **Resolve candidates against the workspace**:
+   - `kognitos_books(list, workspace=<target>)` → installed books.
+   - For each requirement, intersect candidate_books with installed_books → `installed_books` field.
+   - For each installed candidate, `kognitos_books(search_procedures, book=<X>, query=<intent_description>)` → `matched_procedures` field.
+4. **Assign a per-requirement resolution**:
+   - `satisfied` — at least one installed candidate has a high-confidence procedure match.
+   - `needs_confirmation` — installed book(s) found but the procedure match is weak or ambiguous (multiple plausible candidates from the LLM-only case, Excel vs Microsoft Excel, etc.). Write a verbatim `confirmation_question` for the SE.
+   - `missing` — no candidate book is installed in the workspace.
+5. **Write `<OUTPUT_BASE_DIR>/workspace_book_inventory.json`** per the schema (`schemas/workspace_book_inventory.schema.json`). Validate with `tools/validate.py`.
+
+#### Gate behavior
+
+- `overall_status == "satisfied"` → proceed to Phase B iteration.
+- `overall_status == "needs_confirmation"` → **batch** all soft surfaces into one consolidated message to the SE (one round, all pending confirmations at once). When the SE responds, update each requirement's resolution and re-evaluate `overall_status`. Then proceed.
+- `overall_status == "blocked"` → emit `migration_outcome.json` with `book_missing_procedure` terminal state, populated `blockers` array. STOP. Do not proceed to iteration.
+
+#### Why this gate is non-trivial
+
+The KLang line that needs a book is rarely as obvious as `from netsuite`. The hardest cases:
+
+- **Implicit IDP**: `extract the line items from the invoice` doesn't mention IDP, but it needs IDP's `Extract data from a thing` or `Extract table from a thing`.
+- **Koncierge ambiguity**: an `ask the LLM what category this is` block could route to Anthropic/OpenAI/Gemini or be implemented inline in SPy. The preflight surfaces this as `needs_confirmation` because picking the wrong one will waste iterations downstream.
+- **Browser-vs-SaaS**: when the V1 KLang walks a UI for a service the workspace has a real SaaS book for (e.g. browsing NetSuite when the NetSuite book is installed), the migration may prefer the SaaS book — but that's a Phase B iteration decision, not a preflight one. The preflight records both candidates; the SE decides.
+
+#### What the preflight does NOT do
+
+- **Does not** verify procedure inputs/outputs match the V1 line's payload shape — that's the iteration loop's job (the new book-contract check, when in scope).
+- **Does not** decide between candidate books for the SE; ambiguous cases are surfaced verbatim.
+- **Does not** install or authorize books. Those are SE actions outside the agent's authority.
+
+---
+
 Produce per stage (each stage gets its own SPy candidate):
 
 - `<OUTPUT_BASE_DIR>/spy_iterations/stage<N>/spy_candidate_v1.txt`
