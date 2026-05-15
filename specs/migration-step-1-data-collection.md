@@ -616,11 +616,15 @@ Procedure:
 
 1. For each child KLang stage `<N>` (`language == "klang"` and no independent runs), find its `documentToken` by inspecting the orchestrator's trace at the line where it's invoked (`subDocuments[i].documentToken`).
 2. For each orchestrator run in `_orchestrator_runs_index.json`, call `getSentenceExecutionData(workerId=<run_id>, documentToken=<child_token>, token=null)` via Apollo Client.
-3. For each branch in `branch_catalog.json[stages][<N>][branches]`, locate the predicate's `lineId` in the worker doc and check the corresponding exec entry's `display_value` (`"Condition Met"` / `"Condition Not Met"` / null).
+3. For each branch in `branch_catalog.json[stages][<N>][branches]`:
+   - **`if` / `else if` branches** (predicate does not start with `else `): locate the predicate's `lineId` in the worker doc and check the corresponding exec entry's `display_value`. The branch fired when `display_value == "Condition Met"`.
+   - **`else` branches** (predicate starts with `else ` — the catalog convention from Phase A, e.g. `else (count > 0)`): there is no own predicate line; the else fires whenever the sibling `if`'s `display_value == "Condition Not Met"`. The sibling is the most recent preceding branch in the same `branches[]` array whose predicate does **not** start with `else `. Look up that sibling's `lineId` exec entry and treat `"Condition Not Met"` as the trigger for this else branch. (`null` means the if was unreached, not that the else fired — do not count those.)
 4. Record per (run, child stage, branch) → did this branch fire? Aggregate into `_branch_triage.json` under `stages[<N>][<branch>].candidates` — each candidate is a `(orchestrator_run_id, child_document_token)` pair.
 5. The Phase C selection rule (up to 5 reps per branch path, prefer input diversity) applies to these sub-document branches the same way it applies to orchestrator branches. The "rep" is an orchestrator run; deep-capturing that run automatically deep-captures the child stage.
 
 This sweep is the only path to determining child-stage branch coverage. Skipping it leaves child-stage branches that *were* exercised in some orchestrator run looking like coverage gaps. Run it before declaring child-stage `coverage_gaps`.
+
+Skipping the else-branch handling in step 3 silently marks `else`-paths as `confirmed_unobserved` even when they are the dominant path (the if's `Condition Not Met` count is the else's hit count). Verified on `to perform PO digitization` stage 3, where B3d_else and B3j_else showed 0 candidates pre-fix despite their sibling `_met` branches having ~12 hits and the `_else` paths being implied for the remaining ~124 runs.
 
 ### Phase C — Per-run deep capture
 
