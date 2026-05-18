@@ -260,8 +260,8 @@ Before iteration #1, verify the target workspace has the **connected** books and
 For determining what books exist and what procedures they expose:
 
 1. **MCP first** — `kognitos_books` actions. Source of truth for procedure signatures and connection state.
-2. **Local docs gitbook fallback** — `~/Kognitos/docs-gitbook/guides-v2/platform/integrations/*.md`. Use when MCP returns ambiguous results, the intent is too verbose, or you need to enumerate candidate book names by keyword (e.g., `grep -l email integrations/*.md` → `gmail.md`, `outlook.md`, `email.md`).
-3. **`books.md`** — a curated 64-integration digest kept in this repo. Convenience cheat-sheet; not authoritative when it disagrees with MCP or the docs gitbook.
+2. **In-repo snapshot fallback** — `books-catalog/*.md` (one .md per integration; snapshot of `Kognitos/docs-gitbook` `guides-v2/platform/integrations/`). Use when MCP returns ambiguous results, the intent is too verbose, or you need to enumerate candidate book names by keyword (e.g., `grep -l email books-catalog/*.md` → `gmail.md`, `outlook.md`, `email.md`). See `books-catalog/README.md` for the pinned upstream commit and refresh procedure.
+3. **`books.md`** — a curated 64-integration digest kept in this repo. Convenience cheat-sheet; not authoritative when it disagrees with MCP or the in-repo snapshot.
 
 > **Do NOT use `kognitos_books(action="list_workspace_books")`.** The action name is misleading: it returns the org-tenant catalog, not the workspace's connected books. Confirmed empirically (2026-05-15) — calling it against a workspace with zero connections still returned Airtable.
 
@@ -326,7 +326,7 @@ kognitos_books(action="search_procedures",
 If MCP returns nothing useful and the intent looks valid:
 
 - The `intent_description` is probably too verbose or too custom. Try shorter, more book-keyword-ish phrasing ("send email", "extract from PDF", "read spreadsheet").
-- Scan local docs gitbook by keyword: `grep -li <keyword> ~/Kognitos/docs-gitbook/guides-v2/platform/integrations/*.md` → list of candidate books. Re-query MCP with `<book_name>` in the query string.
+- Scan the in-repo snapshot by keyword: `grep -li <keyword> books-catalog/*.md` → list of candidate books. Re-query MCP with `<book_name>` in the query string.
 - If still inconclusive → mark `not_in_platform` and surface to the SE with the candidate keyword list and what was tried.
 
 ##### Step 5 — Write inventory
