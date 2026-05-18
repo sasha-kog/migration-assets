@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://kognitos.example/schemas/workspace_book_inventory.schema.json",
   "title": "workspace_book_inventory.json",
-  "description": "Phase B Preflight output. Produced before the SPy iteration loop begins. Lists every book required by the captured V1 KLang (per stage), whether the target workspace has it installed, and whether installed books expose a procedure that matches the intent. Lines that do not require a book (control flow, arithmetic, string ops) are omitted.",
+  "description": "Phase B Preflight output. Produced before the SPy iteration loop begins. Lists every book required by the captured V1 source (KLang stages + Python stages, per stage), whether the target workspace has an active CONNECTION for that book, and whether the connected procedure matches the intent. Lines that do not require a book (control flow, arithmetic, string ops) are omitted. NOTE: 'connected' means a workspace connection exists in READY state, not merely that the book is in the platform catalog.",
   "type": "object",
   "required": ["generated_at", "target_workspace", "stages", "overall_status"],
   "additionalProperties": false,
@@ -42,12 +42,12 @@
     },
     "overall_status": {
       "type": "string",
-      "enum": ["satisfied", "needs_confirmation", "blocked"],
-      "description": "satisfied: every requirement resolved to an installed book with a matched procedure. needs_confirmation: at least one requirement is soft-surfaced for SE confirmation, no hard blocks. blocked: at least one required book is not installed in the workspace."
+      "enum": ["all_connected", "needs_action", "blocked"],
+      "description": "all_connected: every requirement has resolution 'connected' AND no pending_confirmations. needs_action: at least one requirement is 'available_not_connected' (book exists on platform, no workspace connection) OR there is a pending_confirmation (e.g. choice between two connected candidate books). blocked: at least one requirement is 'not_in_platform' (book doesn't exist on the platform catalog at all)."
     },
     "blockers": {
       "type": "array",
-      "description": "Populated when overall_status == 'blocked'. Each entry corresponds to a book_requirement whose resolution is 'missing'.",
+      "description": "Populated when overall_status == 'blocked'. Each entry corresponds to a book_requirement whose resolution is 'not_in_platform' (i.e., not even available to be connected). The SE's choice is between an Astral-build for the missing book, scope-cutting the requirement, or revisiting intent classification.",
       "items": {
         "type": "object",
         "required": ["stage", "intent_description", "candidate_books", "evidence_lines"],
@@ -61,19 +61,39 @@
         }
       }
     },
-    "pending_confirmations": {
+    "connections_needed": {
       "type": "array",
-      "description": "Populated when overall_status == 'needs_confirmation'. Batched questions for the SE; the agent waits for one combined response before continuing.",
+      "description": "Populated when overall_status == 'needs_action' and the reason is at least one requirement with resolution 'available_not_connected'. Lists the platform-available books that the SE must connect in the workspace (or authorize Quill to request mid-Phase-B) before iteration can proceed cleanly.",
       "items": {
         "type": "object",
-        "required": ["stage", "intent_description", "candidate_books", "question"],
+        "required": ["stage", "intent_description", "candidate_books", "evidence_lines"],
+        "additionalProperties": true,
+        "properties": {
+          "stage": { "type": "string" },
+          "intent_description": { "type": "string" },
+          "candidate_books": { "type": "array", "items": { "type": "string" }, "description": "Books available on the platform that satisfy this intent. SE picks one to connect; or accepts a Quill request_connection deferral." },
+          "evidence_lines": { "type": "array", "items": { "type": "integer", "minimum": 1 } }
+        }
+      }
+    },
+    "pending_confirmations": {
+      "type": "array",
+      "description": "Populated when overall_status == 'needs_action'. Batched questions for the SE; the agent waits for one combined response before continuing. Typical questions: 'Two connected candidates satisfy this intent — which one?', 'V1 Python uses HTTP wrapper but procedure name suggests native book — preserve or re-architect?', 'V1 KLang uses dept-box (cross-run state) — keep as native S3 or in-SPy dict?'.",
+      "items": {
+        "type": "object",
+        "required": ["stage", "intent_description", "question"],
         "additionalProperties": true,
         "properties": {
           "stage": { "type": "string" },
           "intent_description": { "type": "string" },
           "candidate_books": { "type": "array", "items": { "type": "string" } },
           "evidence_lines": { "type": "array", "items": { "type": "integer", "minimum": 1 } },
-          "question": { "type": "string", "description": "Verbatim text shown to the SE." }
+          "question": { "type": "string", "description": "Verbatim text shown to the SE." },
+          "confirmation_type": {
+            "type": "string",
+            "enum": ["choose_between_connected_candidates", "preserve_v1_or_re_architect", "architectural_choice", "intent_ambiguity", "other"],
+            "description": "Hint to downstream tooling about what kind of decision is being asked."
+          }
         }
       }
     }
@@ -112,41 +132,37 @@
           "minItems": 1,
           "description": "Candidate book names from books.md. Length 1 for explicit cases (e.g. 'from netsuite'); >1 when ambiguous (e.g. Excel vs Microsoft Excel) or when the choice between LLM book vs inline SPy applies."
         },
-        "installed_books": {
-          "type": "array",
-          "items": { "type": "string" },
-          "description": "Subset of candidate_books that are installed in the target workspace per kognitos_books(list)."
-        },
         "matched_procedures": {
           "type": "array",
-          "description": "Procedures returned by kognitos_books(search_procedures, book=<X>, query=<intent_description>) that the agent believes satisfy the intent.",
+          "description": "Procedures returned by kognitos_books(search_procedures, query=<intent_description>) — workspace-scoped first (Step 2 of the preflight procedure), then global fallback (Step 3). Filtered to results whose book_name is in candidate_books. Includes both in_workspace=true (connected) and in_workspace=false (available_not_connected) entries.",
           "items": {
             "type": "object",
-            "required": ["book", "procedure_signature"],
+            "required": ["book_name", "procedure_signature"],
             "additionalProperties": true,
             "properties": {
-              "book": { "type": "string" },
-              "procedure_signature": { "type": "string" },
-              "rank": { "type": "number" }
+              "book_name": { "type": "string", "description": "Book identifier as returned by the MCP, e.g. 'gmail', 'outlook', 'csv'." },
+              "procedure_signature": { "type": "string", "description": "Human-readable procedure signature, e.g. 'to send an email'." },
+              "procedure_id": { "type": "string", "description": "Procedure ID, e.g. 'send_email'." },
+              "rank": { "type": "number", "description": "Semantic-search score from search_procedures. NOTE: scores can be low (≤0.05) even on correct matches — do not threshold on this field." },
+              "connection_id": { "type": "string", "description": "Active connection identifier in the target workspace (e.g. 'csv-b8qhl'). Present iff in_workspace == true. Quill can target this via search_workspace_book_connection_procedures." },
+              "in_workspace": { "type": "boolean", "description": "true if this procedure was returned by workspace-scoped search (active connection exists). false if returned only by global search (platform-available but not connected)." }
             }
           }
         },
+        "chosen_book": {
+          "type": "string",
+          "description": "Selected book for this requirement. Populated when resolution == 'connected' and there's only one candidate, OR after the SE answers a 'choose_between_connected_candidates' pending_confirmation."
+        },
+        "chosen_connection_id": {
+          "type": "string",
+          "description": "Active connection_id for the chosen_book. Populated alongside chosen_book."
+        },
         "resolution": {
           "type": "string",
-          "enum": ["satisfied", "needs_confirmation", "missing"],
-          "description": "satisfied: installed book exposes a high-confidence procedure match. needs_confirmation: installed book exposes weak/ambiguous matches OR multiple candidate books are plausible. missing: no candidate book is installed in the workspace."
-        },
-        "confirmation_question": {
-          "type": "string",
-          "description": "Required iff resolution == 'needs_confirmation'. Verbatim text the agent surfaces to the SE."
+          "enum": ["connected", "available_not_connected", "not_in_platform"],
+          "description": "connected: workspace-scoped search_procedures returned a procedure from a candidate_books entry (active connection exists, in_workspace==true on at least one matched_procedure). available_not_connected: no candidate book has an active workspace connection, but global search_procedures returns at least one candidate book — SE must connect it (or authorize Quill request_connection). not_in_platform: global search_procedures returns nothing matching any candidate book — the platform doesn't expose this capability."
         }
-      },
-      "allOf": [
-        {
-          "if": { "properties": { "resolution": { "const": "needs_confirmation" } } },
-          "then": { "required": ["confirmation_question"] }
-        }
-      ]
+      }
     }
   }
 }

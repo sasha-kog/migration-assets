@@ -253,36 +253,98 @@ Phase B is **Nexus-only** — it does not require cluster-shell, direct DB acces
 
 ### Phase B Preflight — Book Capability Check
 
-Before iteration #1, verify the target workspace has the books and procedures the captured V1 KLang implies. Hard-block when a required book is not installed; soft-surface (batched, one round of SE confirmation) when an installed book is present but procedure coverage is ambiguous. Lines that do not need a book — pure control flow, arithmetic, string operations — are excluded from the inventory entirely.
+Before iteration #1, verify the target workspace has the **connected** books and procedures the captured V1 implies. A book *existing on the platform* is not enough — Quill cannot call procedures from a book whose workspace connection isn't `READY`. Lines that do not need a book — pure control flow, arithmetic, string operations — are excluded from the inventory entirely.
 
-Reference for KLang → candidate-book classification: `books.md` (digest of the 64 installed integrations, with KLang-pattern → candidate-book mappings).
+#### Catalog source order
+
+For determining what books exist and what procedures they expose:
+
+1. **MCP first** — `kognitos_books` actions. Source of truth for procedure signatures and connection state.
+2. **In-repo snapshot fallback** — `books-catalog/*.md` (one .md per integration; snapshot of `Kognitos/docs-gitbook` `guides-v2/platform/integrations/`). Use when MCP returns ambiguous results, the intent is too verbose, or you need to enumerate candidate book names by keyword (e.g., `grep -l email books-catalog/*.md` → `gmail.md`, `outlook.md`, `email.md`). See `books-catalog/README.md` for the pinned upstream commit and refresh procedure.
+3. **`books.md`** — a curated 64-integration digest kept in this repo. Convenience cheat-sheet; not authoritative when it disagrees with MCP or the in-repo snapshot.
+
+> **Do NOT use `kognitos_books(action="list_workspace_books")`.** The action name is misleading: it returns the org-tenant catalog, not the workspace's connected books. Confirmed empirically (2026-05-15) — calling it against a workspace with zero connections still returned Airtable.
 
 #### Procedure
 
-Per stage in the `<STAGES>` table:
+##### Step 1 — Source-code analysis (no MCP)
 
-1. **Walk the stage's KLang** at `klang/stage<N>_<slug>.txt` line by line. Skip lines that are clearly book-free (`if … then`, loops, comparisons, arithmetic, string assignment, control flow).
-2. **For each non-skipped line, classify the intent** using `books.md`:
-   - `explicit_book_clause` — `from <book>`, `in <book>`, `to <book>`. The book name is verbatim in the KLang.
-   - `document_capability` — extract/classify/analyze/read/split/merge over a document. Default candidate: **IDP**.
-   - `ui_capability` — visible browser interaction. Candidates: **Browser**, **Browser Use**.
-   - `saas_capability` — named-service verb whose book is unambiguous (e.g. NetSuite, Gmail).
-   - `llm_only` — free-form Koncierge over plain values, no document. Candidates: **Anthropic / OpenAI / Gemini** OR pure SPy with inline Koncierge. Do not pick.
-3. **Resolve candidates against the workspace**:
-   - `kognitos_books(list, workspace=<target>)` → installed books.
-   - For each requirement, intersect candidate_books with installed_books → `installed_books` field.
-   - For each installed candidate, `kognitos_books(search_procedures, book=<X>, query=<intent_description>)` → `matched_procedures` field.
-4. **Assign a per-requirement resolution**:
-   - `satisfied` — at least one installed candidate has a high-confidence procedure match.
-   - `needs_confirmation` — installed book(s) found but the procedure match is weak or ambiguous (multiple plausible candidates from the LLM-only case, Excel vs Microsoft Excel, etc.). Write a verbatim `confirmation_question` for the SE.
-   - `missing` — no candidate book is installed in the workspace.
-5. **Write `<OUTPUT_BASE_DIR>/workspace_book_inventory.json`** per the schema (`schemas/workspace_book_inventory.schema.json`). Validate with `tools/validate.py`.
+For every stage in `<STAGES>`:
+
+- **KLang stages** (`language == "klang"`): walk `klang/stage<N>_<slug>.txt` line by line. Skip pure control flow (`if … then`, loops, comparisons, arithmetic, string assignment, file binding).
+- **Python stages** (`language == "python"`): scan `python/stage<N>_<slug>.py` for:
+  - `import` statements (other than stdlib and Kognitos BCI helpers `kognitos.bci`, `kognitos.messaging.bci`).
+  - Outbound calls: `requests.*`, `httpx.*`, third-party SDK class names, LLM client init (`openai.`, `anthropic.`, `google.generativeai.`).
+  - Each external-call site = one `explicit_book_clause` requirement with `intent_description` describing the call and `evidence_lines` pointing at the import + the call site.
+
+For each non-skipped line/call, classify the intent into one of:
+
+- `explicit_book_clause` — `from <book>`, `in <book>`, `to <book>`, or a Python outbound call. Book identity may be verbatim in the KLang or inferred from the Python target (e.g., a `requests.get` to `https://*.azure.com/` → candidate `azure_blob_storage`).
+- `document_capability` — extract/classify/analyze/read/split/merge over a document. Default candidate: **IDP**.
+- `ui_capability` — visible browser interaction. Candidates: **Browser**, **Browser Use**.
+- `saas_capability` — named-service verb whose book is unambiguous (e.g. NetSuite, Gmail).
+- `llm_only` — free-form Koncierge over plain values, no document. Candidates: **Anthropic / OpenAI / Gemini** OR pure SPy with inline Koncierge. Do not pick.
+
+Output an in-memory list of `{stage, line(s), intent_description, intent_category, candidate_book_keywords[]}`. No MCP calls in this step.
+
+> **Python misnomer warning.** A V1 Python stage's procedure *name* may suggest a specific book (e.g., `to_download_a_document_from_azure_blob_storage.py`) while the actual `requests` calls hit a different endpoint with different credentials. **Classify from the call payload + credentials, not the file name.** Surface the choice — "preserve V1 HTTP semantics" vs "re-architect to native book" — as a `needs_choice` confirmation, not a silent classification.
+
+##### Step 2 — Connection check (per requirement)
+
+For each requirement: call
+
+```
+kognitos_books(action="search_procedures",
+               organization_id=<target.org_id>,
+               workspace_id=<target.workspace_id>,
+               query=<intent_description>)
+```
+
+**Filter results by `book_name`** — do not just check non-empty.
+
+- If any result has `book_name` ∈ `candidate_book_keywords` → `resolution = "connected"`. Record `connection_id`, `book_name`, `procedure.signature.english`, and the rank score into `matched_procedures` with `in_workspace: true`.
+- If only one candidate book is connected → that's the chosen book.
+- If ≥2 candidate books are connected (e.g. Gmail and Microsoft Outlook both satisfy `send email`) → resolution stays `connected` but add a `pending_confirmation` entry of type `choose_between_connected_candidates` with a verbatim question.
+- If no result matches the candidates → fall through to Step 3.
+
+> **Why filter by `book_name`:** workspace-scoped `search_procedures` returns *any* connected procedures ranked by semantic match. With only one book connected, it will return that book's procedures even for unrelated queries (verified 2026-05-15: CSV-connected workspace + query "send email" → CSV procedures with low score 0.04). A non-empty response is not evidence of a match.
+
+##### Step 3 — Catalog check (only when Step 2 found no candidate book)
+
+Call the same procedure search **without** workspace scope:
+
+```
+kognitos_books(action="search_procedures",
+               query=<intent_description>)
+```
+
+- If any result has a `book_name` that satisfies the intent → `resolution = "available_not_connected"`. Record the candidates in `matched_procedures` with `in_workspace: false`.
+- If global returns nothing recognizable → `resolution = "not_in_platform"`. Hard blocker.
+
+##### Step 4 — Disambiguation fallback (only when Steps 2 + 3 are inconclusive)
+
+If MCP returns nothing useful and the intent looks valid:
+
+- The `intent_description` is probably too verbose or too custom. Try shorter, more book-keyword-ish phrasing ("send email", "extract from PDF", "read spreadsheet").
+- Scan the in-repo snapshot by keyword: `grep -li <keyword> books-catalog/*.md` → list of candidate books. Re-query MCP with `<book_name>` in the query string.
+- If still inconclusive → mark `not_in_platform` and surface to the SE with the candidate keyword list and what was tried.
+
+##### Step 5 — Write inventory
+
+Write `<OUTPUT_BASE_DIR>/workspace_book_inventory.json` per `schemas/workspace_book_inventory.schema.json`. Run `python3 tools/validate.py <OUTPUT_BASE_DIR>` afterward.
+
+> **Known validator gap (2026-05-15):** `tools/validate.py` does not currently include `workspace_book_inventory.json` in its `FILENAME_TO_SCHEMA` map — running `validate.py <dir>` silently skips the file. Validate directly with `jsonschema.Draft202012Validator` against the schema until the validator is patched. Surface as a tooling issue if it bites you.
 
 #### Gate behavior
 
-- `overall_status == "satisfied"` → proceed to Phase B iteration.
-- `overall_status == "needs_confirmation"` → **batch** all soft surfaces into one consolidated message to the SE (one round, all pending confirmations at once). When the SE responds, update each requirement's resolution and re-evaluate `overall_status`. Then proceed.
-- `overall_status == "blocked"` → emit `migration_outcome.json` with `book_missing_procedure` terminal state, populated `blockers` array. STOP. Do not proceed to iteration.
+`overall_status` is derived from per-requirement resolutions:
+
+- `all_connected` — every requirement is `connected` and no `pending_confirmations`. Proceed to Phase B iteration.
+- `needs_action` — at least one requirement is `available_not_connected`, **or** there is at least one `pending_confirmation` (choice between connected candidates / Python misnomer / dept-box-style architectural question). **Batch** all open actions into one consolidated message to the SE. After the SE responds:
+  - For `connect_book` items: SE either connects in the UI (`needs_action` → `all_connected` after re-run) **or** authorizes Quill to call `request_connection` mid-Phase-B (record the deferral, proceed).
+  - For `choose_between_*` items: SE selects a book; update `chosen_book` and `chosen_connection_id` on the requirement.
+  - Re-evaluate `overall_status`.
+- `blocked` — at least one requirement is `not_in_platform`. Emit `migration_outcome.json` with `book_missing_procedure` terminal state, populated `blockers` array. STOP unless the SE explicitly approves an Astral-build for the missing book.
 
 #### Why this gate is non-trivial
 
